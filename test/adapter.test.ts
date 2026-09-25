@@ -1,0 +1,491 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { GenerateOptions, LlmModelInfo } from '@deepseek-ai/dsh-llm'
+import { CodeBuddyAdapter, httpErrorCode } from '../src/adapter.js'
+import type { CodeBuddyConnectionOptions } from '../src/adapter.js'
+import type { CodeBuddySession } from '../src/session.js'
+import { NotLoggedInError } from '../src/session.js'
+import { REQUEST_TIMEOUT_MS } from '../src/constants.js'
+import type { CodeBuddyModel } from '../src/types.js'
+import { DONE } from '../src/sse.js'
+
+const connection: CodeBuddyConnectionOptions = {
+  baseURL: 'https://copilot.tencent.com/v2',
+  defaultContextWindow: 128_000,
+  defaultMaxTokens: 8_192,
+  streamIdleTimeoutMs: 300_000,
+}
+
+interface FakeSession {
+  authHeaders(): Promise<Record<string, string>>
+  models(signal?: AbortSignal): Promise<readonly CodeBuddyModel[]>
+  modelsOrEmpty(signal?: AbortSignal): Promise<readonly CodeBuddyModel[]>
+}
+
+function fakeSession(overrides: Partial<FakeSession> = {}): CodeBuddySession {
+  return {
+    authHeaders: overrides.authHeaders ?? (async () => ({ Authorization: 'Bearer t', 'X-Domain': 'd' })),
+    models: overrides.models ?? (async () => [] as CodeBuddyModel[]),
+    modelsOrEmpty: overrides.modelsOrEmpty ?? (async () => [] as CodeBuddyModel[]),
+  } as unknown as CodeBuddySession
+}
+
+function adapter(session: CodeBuddySession, options: Partial<CodeBuddyConnectionOptions> = {}): CodeBuddyAdapter {
+  return new CodeBuddyAdapter({ session, options: () => ({ ...connection, ...options }) })
+}
+
+/** 与 adapter() 同，但可注入语言来源（失败文案按界面语言上报）。 */
+function adapterWithLanguage(session: CodeBuddySession, language: () => string | undefined): CodeBuddyAdapter {
+  return new CodeBuddyAdapter({ session, options: () => connection, language })
+}
+
+function sseBody(lines: string[]): ReadableStream<Uint8Array> {
+  const enc = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      for (const line of lines) controller.enqueue(enc.encode(line + '\n\n'))
+      controller.close()
+    },
+  })
+}
+
+function streamResponse(lines: string[]): Response {
+  return {
+    ok: true,
+    status: 200,
+    headers: new Headers(),
+    body: sseBody(lines),
+  } as unknown as Response
+}
+
+function errorResponse(status: number, body: unknown): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers(),
+    json: async () => body,
+  } as unknown as Response
+}
+
+interface FetchCall {
+  url: string
+  init: { method?: string; headers?: Record<string, string>; body?: string; signal?: unknown }
+}
+
+function installFetch(handler: (url: string, init: FetchCall['init']) => unknown) {
+  const calls: FetchCall[] = []
+  const mock = vi.fn(async (url: string, init: FetchCall['init']) => {
+    calls.push({ url, init })
+    return handler(url, init)
+  })
+  vi.stubGlobal('fetch', mock)
+  return { mock, calls }
+}
+
+function genOptions(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
+  return {
+    provider: 'codebuddy',
+    model: 'm1',
+    messages: [],
+    ...overrides,
+  }
+}
+
+function collect(iterable: AsyncIterable<unknown>): Promise<unknown[]> {
+  return (async () => {
+    const out: unknown[] = []
+    for await (const value of iterable) out.push(value)
+    return out
+  })()
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+describe('httpErrorCode', () => {
+  it('maps 401 and 403 to AUTH', () => {
+    expect(httpErrorCode(401)).toBe('AUTH')
+    expect(httpErrorCode(403)).toBe('AUTH')
+  })
+
+  it('maps 429 to RATE_LIMIT', () => {
+    expect(httpErrorCode(429)).toBe('RATE_LIMIT')
+  })
+
+  it('maps 400 with context-window wording to CONTEXT_WINDOW_EXCEEDED', () => {
+    expect(httpErrorCode(400, 'request exceeded the model context window')).toBe('CONTEXT_WINDOW_EXCEEDED')
+  })
+
+  it('maps 400 without context wording to INVALID_REQUEST', () => {
+    expect(httpErrorCode(400, 'malformed body')).toBe('INVALID_REQUEST')
+  })
+
+  it('maps 500 and above to SERVER', () => {
+    expect(httpErrorCode(500)).toBe('SERVER')
+    expect(httpErrorCode(503)).toBe('SERVER')
+  })
+
+  it('maps quota wording to QUOTA before the 429 branch', () => {
+    expect(httpErrorCode(429, 'insufficient quota')).toBe('QUOTA')
+  })
+})
+
+describe('resolveModel', () => {
+  it('uses the catalog capacity when the model is listed', async () => {
+    const session = fakeSession({
+      models: async () => [{
+        id: 'm1', name: 'Model One',
+        maxAllowedSize: 200_000, maxOutputTokens: 16_384, supportsImages: true,
+        reasoning: { supportedEfforts: ['low', 'high'], defaultEffort: 'low' },
+      }],
+    })
+    const resolved = await adapter(session).resolveModel('codebuddy', 'm1')
+    expect(resolved.context).toEqual({ contextWindow: 200_000 })
+    expect(resolved.defaultMaxTokens).toBe(16_384)
+    expect(resolved.inputModalities).toEqual(['text', 'image'])
+    expect(resolved.reasoning).toEqual({
+      efforts: [{ id: 'low', name: 'low' }, { id: 'high', name: 'high' }],
+      defaultEffort: 'low',
+    })
+  })
+
+  it('declares reasoning for a model that names one level without listing any', async () => {
+    // 真实目录里 auto/glm-5.1/kimi-k2.6 等 7 个模型正是这个形状：
+    // supportsReasoning + 只给 effort、没有 supportedEfforts。
+    // 旧实现只读列表 → reasoning 为 undefined → 请求不带任何思考等级。
+    const session = fakeSession({
+      models: async () => [{
+        id: 'auto', name: 'Auto', supportsReasoning: true, onlyReasoning: true,
+        maxAllowedSize: 168_000, maxOutputTokens: 32_000,
+        reasoning: { effort: 'high', summary: 'auto' },
+      }],
+    })
+    const resolved = await adapter(session).resolveModel('codebuddy', 'auto')
+    expect(resolved.reasoning).toEqual({
+      efforts: [{ id: 'high', name: 'high' }],
+      defaultEffort: 'high',
+    })
+  })
+
+  it('declares reasoning for a model that reasons but discloses no reasoning block at all', async () => {
+    // kimi-k2.8-preview：supportsReasoning=true 且 reasoning 完全缺失。
+    const session = fakeSession({
+      models: async () => [{
+        id: 'kimi-k2.8-preview', name: 'Kimi', supportsReasoning: true, onlyReasoning: true,
+        maxAllowedSize: 256_000, maxOutputTokens: 32_768,
+      }],
+    })
+    const resolved = await adapter(session).resolveModel('codebuddy', 'kimi-k2.8-preview')
+    // 没有等级可声明时仍不伪造一个：不声明胜过声明一个不存在的控制项。
+    expect(resolved.reasoning).toBeUndefined()
+  })
+
+  it('adds the named level to the selectable list so the harness accepts the default', async () => {
+    // 宿主会拒绝一个不在 efforts 里的 defaultEffort；点名的等级必须进列表。
+    const session = fakeSession({
+      models: async () => [{
+        id: 'm', name: 'M', supportsReasoning: true,
+        maxAllowedSize: 100_000, maxOutputTokens: 8_000,
+        reasoning: { defaultEffort: 'high', supportedEfforts: ['low'] },
+      }],
+    })
+    const resolved = await adapter(session).resolveModel('codebuddy', 'm')
+    const ids = resolved.reasoning?.efforts.map(e => e.id)
+    expect(ids).toContain('high')
+    expect(resolved.reasoning?.defaultEffort).toBe('high')
+  })
+
+  it('prefers the server-side active effort over defaultEffort', async () => {
+    const session = fakeSession({
+      models: async () => [{
+        id: 'm', name: 'M', supportsReasoning: true,
+        maxAllowedSize: 100_000, maxOutputTokens: 8_000,
+        reasoning: { effort: 'medium', defaultEffort: 'high', supportedEfforts: ['high'] },
+      }],
+    })
+    const resolved = await adapter(session).resolveModel('codebuddy', 'm')
+    expect(resolved.reasoning?.defaultEffort).toBe('medium')
+  })
+
+  it('declares no reasoning for a model that does not reason', async () => {
+    const session = fakeSession({
+      models: async () => [{ id: 'plain', name: 'Plain', maxAllowedSize: 100_000, maxOutputTokens: 8_000 }],
+    })
+    const resolved = await adapter(session).resolveModel('codebuddy', 'plain')
+    expect(resolved.reasoning).toBeUndefined()
+  })
+
+  it('falls back to conservative text-only defaults for an out-of-catalog explicit id', async () => {
+    const session = fakeSession({ models: async () => [] })
+    const resolved = await adapter(session).resolveModel('codebuddy', 'unknown-model')
+    expect(resolved).toEqual({
+      provider: 'codebuddy',
+      id: 'unknown-model',
+      name: 'unknown-model',
+      inputModalities: ['text'],
+      context: { contextWindow: 128_000 },
+      defaultMaxTokens: 8_192,
+    })
+  })
+})
+
+describe('listModels', () => {
+  it('returns only models that disclose capacity', async () => {
+    const session = fakeSession({
+      modelsOrEmpty: async () => [
+        { id: 'full', name: 'Full', maxAllowedSize: 100_000, maxOutputTokens: 8_000 },
+        { id: 'no-capacity', name: 'No Capacity' },
+        { id: 'zero', name: 'Zero', maxAllowedSize: 0, maxOutputTokens: 0 },
+      ],
+    })
+    const models = await adapter(session).listModels('codebuddy')
+    expect(models.map((model: LlmModelInfo) => model.id)).toEqual(['full'])
+    expect(models[0]?.inputModalities).toEqual(['text'])
+  })
+})
+
+describe('providerInfo', () => {
+  it('returns the CodeBuddy display name for the route', () => {
+    const info = adapter(fakeSession()).providerInfo('codebuddy')
+    expect(info).toEqual({ id: 'codebuddy', name: 'CodeBuddy' })
+  })
+})
+
+describe('stream', () => {
+  it('sends the white-label user-agent header without deepseek-harness, plus auth headers', async () => {
+    const { calls } = installFetch(() => streamResponse([
+      'data: ' + JSON.stringify({ choices: [{ delta: { content: 'Hello' } }] }),
+      'data: ' + DONE,
+    ]))
+    await collect(adapter(fakeSession()).stream(genOptions()))
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.url).toBe('https://copilot.tencent.com/v2/chat/completions')
+    const headers = calls[0]?.init.headers ?? {}
+    const userAgent = headers['user-agent'] ?? headers['User-Agent'] ?? ''
+    expect(userAgent).toMatch(/^dsh-codebuddy\/\d+\.\d+\.\d+ \(\+https:\/\/github\.com\/minglo\/dsh-plugin-codebuddy\)$/)
+    expect(userAgent.toLowerCase()).not.toContain('deepseek-harness')
+    expect(headers['Authorization']).toBe('Bearer t')
+    expect(headers['X-Domain']).toBe('d')
+  })
+
+  it('forwards the caller signal to fetch (combined with the deadline)', async () => {
+    const controller = new AbortController()
+    const { calls } = installFetch(() => streamResponse(['data: ' + DONE]))
+    await collect(adapter(fakeSession()).stream(genOptions({ signal: controller.signal })))
+    expect(calls[0]?.init.signal).toBeDefined()
+    expect(calls[0]?.init.signal).not.toBe(controller.signal) // 合成 signal（caller + 死线）
+  })
+
+  it('keeps reading the SSE body after the connect deadline (long inference must not be cut at 15s)', async () => {
+    // 回归：header 死线曾以 AbortSignal.timeout 绑到 fetch 全生命周期，15s 后杀掉正在读的
+    // SSE body——模型思考/长回答超过 15s 就报「接口失败」。死线现在只保护连接与响应头。
+    vi.useFakeTimers()
+    try {
+      installFetch((_url: string, init: FetchCall['init']) => {
+        const signal = init.signal as AbortSignal
+        const encoder = new TextEncoder()
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            // 死线之后才出现首个 chunk：越过连接死线，模拟慢推理。
+            timer = setTimeout(() => {
+              controller.enqueue(encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { reasoning_content: 'thinking' } }] }) + '\n\n'))
+              controller.enqueue(encoder.encode('data: ' + DONE + '\n\n'))
+              controller.close()
+            }, REQUEST_TIMEOUT_MS + 1_000)
+            // 真实 fetch 在 signal abort 时会 error 掉 body：mock 必须复刻。
+            signal.addEventListener('abort', () => {
+              if (timer !== undefined) clearTimeout(timer)
+              controller.error(signal.reason)
+            }, { once: true })
+          },
+        })
+        return { ok: true, status: 200, headers: new Headers(), body }
+      })
+
+      const pending = collect(adapter(fakeSession()).stream(genOptions()))
+      await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS + 1_000)
+      const chunks = await pending
+      expect(chunks).toContainEqual({ type: 'reasoning-delta', index: 0, text: 'thinking' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('maps a connect deadline expiry to TIMEOUT instead of TRANSPORT', async () => {
+    vi.useFakeTimers()
+    try {
+      installFetch((_url: string, init: FetchCall['init']) => {
+        const signal = init.signal as AbortSignal
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
+      })
+
+      const pending = collect(adapter(fakeSession()).stream(genOptions()))
+      const rejection = expect(pending).rejects.toMatchObject({ name: 'LlmError', code: 'TIMEOUT' })
+      // 死线来自 REQUEST_TIMEOUT_MS（连接死线只护连接+响应头），不能在测试里写死。
+      await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS)
+      await rejection
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('maps non-2xx responses through httpErrorCode into an LlmError', async () => {
+    installFetch(() => errorResponse(401, { error: { message: 'unauthorized' } }))
+    await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
+      name: 'LlmError',
+      code: 'AUTH',
+      failure: { code: 'AUTH', status: 401 },
+    })
+  })
+
+  it('reads the envelope CodeBuddy actually sends (msg/displayMsg), not just OpenAI error.message', async () => {
+    // 真实失败报文是 {code, msg, extError, displayMsg}：旧实现只读 error.message，
+    // 于是每个 provider 消息都被换成裸 HTTP 状态码。
+    installFetch(() => errorResponse(400, {
+      code: 11101,
+      msg: 'Unmarshal chat params failed',
+      displayMsg: { en: 'Invalid request parameters. Please check and retry.', zh: '请求参数有误，请检查后重试。' },
+    }))
+    await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
+      name: 'LlmError',
+      code: 'INVALID_REQUEST',
+      message: 'Invalid request parameters. Please check and retry.',
+    })
+  })
+
+  it('classifies CONTEXT_WINDOW_EXCEEDED from the real envelope wording', async () => {
+    // 这条以前永远不触发：措辞在 msg/displayMsg 里，而分类器读的是 error.message，
+    // 于是超长对话只会以通用 400 失败，**不会启动溢出压缩**。
+    installFetch(() => errorResponse(400, {
+      code: 400,
+      msg: 'request exceeded the model context window',
+      displayMsg: { en: 'The conversation exceeded the model context window.' },
+    }))
+    await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
+      code: 'CONTEXT_WINDOW_EXCEEDED',
+    })
+  })
+
+  it('classifies QUOTA from a provider extError.message', async () => {
+    installFetch(() => errorResponse(400, {
+      code: 11115,
+      msg: 'upstream rejected',
+      extError: { message: 'insufficient quota for this account' },
+    }))
+    await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
+      code: 'QUOTA',
+    })
+  })
+
+  it('reports the curated sentence in the requested language', async () => {
+    installFetch(() => errorResponse(400, {
+      code: 11101,
+      msg: 'raw service text',
+      displayMsg: { en: 'Invalid request parameters.', zh: '请求参数有误，请检查后重试。', 'zh-hant': '請求參數有誤，請檢查後重試。' },
+    }))
+    const chunks = collect(adapterWithLanguage(fakeSession(), () => 'zh').stream(genOptions()))
+    await expect(chunks).rejects.toMatchObject({ message: '请求参数有误，请检查后重试。' })
+  })
+
+  it('routes a regional Traditional Chinese id to the zh-hant wording', async () => {
+    // 语言包按地区选（zh-TW），而服务把繁中只放在 zh-hant 下；
+    // 按 zh 读会让繁体读者收到简体。
+    installFetch(() => errorResponse(400, {
+      code: 11101,
+      msg: 'raw',
+      displayMsg: { zh: '请求参数有误。', 'zh-hant': '請求參數有誤。' },
+    }))
+    const chunks = collect(adapterWithLanguage(fakeSession(), () => 'zh-TW').stream(genOptions()))
+    await expect(chunks).rejects.toMatchObject({ message: '請求參數有誤。' })
+  })
+
+  it('falls back to the provider message when the envelope curates nothing', async () => {
+    installFetch(() => errorResponse(400, { code: 11115, msg: 'quota exceeded somewhere' }))
+    await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
+      message: 'quota exceeded somewhere',
+    })
+  })
+
+  it('keeps the status-derived error when the error body is unreadable', async () => {
+    // 畸形 JSON 不许把失败盖掉：状态码仍能标识它。
+    installFetch(() => ({
+      ok: false,
+      status: 503,
+      headers: new Headers(),
+      json: async () => { throw new Error('truncated') },
+    } as unknown as Response))
+    await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
+      name: 'LlmError',
+      code: 'SERVER',
+      failure: { code: 'SERVER', status: 503 },
+    })
+  })
+
+  it('does not let a throwing language source discard the envelope', async () => {
+    // 语言只是装饰，失败不是：抛错的语言来源必须被隔离。
+    installFetch(() => errorResponse(400, {
+      code: 400,
+      msg: 'request exceeded the model context window',
+    }))
+    const chunks = collect(adapterWithLanguage(fakeSession(), () => { throw new Error('no locale') }).stream(genOptions()))
+    await expect(chunks).rejects.toMatchObject({ code: 'CONTEXT_WINDOW_EXCEEDED' })
+  })
+
+  it('translates an SSE body into StreamChunks', async () => {
+    installFetch(() => streamResponse([
+      'data: ' + JSON.stringify({ choices: [{ delta: { content: 'Hello' } }] }),
+      'data: ' + DONE,
+    ]))
+    const chunks = await collect(adapter(fakeSession()).stream(genOptions()))
+    expect(chunks[0]).toEqual({ type: 'block-start', index: 0, blockType: 'text' })
+    expect(chunks[1]).toEqual({ type: 'text-delta', index: 0, text: 'Hello' })
+    expect(chunks[2]).toEqual({ type: 'block-end', index: 0, block: { type: 'text', text: 'Hello' } })
+    expect(chunks[3]).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+  })
+
+  it('throws MISSING_CREDENTIAL when the session reports NotLoggedInError', async () => {
+    const session = fakeSession({
+      authHeaders: async () => { throw new NotLoggedInError('signed out') },
+    })
+    await expect(collect(adapter(session).stream(genOptions()))).rejects.toMatchObject({
+      name: 'LlmError',
+      code: 'MISSING_CREDENTIAL',
+    })
+  })
+})
+
+describe('chat request headers', () => {
+  it('sends X-Model-ID set to the routed model', async () => {
+    const { calls } = installFetch(() => streamResponse(['data: ' + DONE]))
+    await collect(adapter(fakeSession()).stream(genOptions({ model: 'claude-sonnet-4.5' })))
+    expect(calls[0].init.headers?.['X-Model-ID']).toBe('claude-sonnet-4.5')
+  })
+
+  it('stamps X-Conversation-ID from the session id', async () => {
+    const { calls } = installFetch(() => streamResponse(['data: ' + DONE]))
+    await collect(adapter(fakeSession()).stream(genOptions({ sessionId: 'sess-42' as never })))
+    expect(calls[0].init.headers?.['X-Conversation-ID']).toBe('sess-42')
+  })
+
+  it('omits X-Conversation-ID when no session id is stamped', async () => {
+    const { calls } = installFetch(() => streamResponse(['data: ' + DONE]))
+    await collect(adapter(fakeSession()).stream(genOptions()))
+    expect(calls[0].init.headers).not.toHaveProperty('X-Conversation-ID')
+  })
+})
+
+describe('providerRetryPolicy', () => {
+  it('returns undefined when no policy is configured', () => {
+    expect(adapter(fakeSession()).providerRetryPolicy('codebuddy')).toBeUndefined()
+  })
+
+  it('returns the policy captured for the route', () => {
+    const policy = { mode: 'normal', maxRetries: 3, retryableCodes: ['TRANSPORT'], initialDelayMs: 100, maxDelayMs: 1_000, jitterRatio: 0.1 }
+    const instance = adapter(fakeSession(), { retryPolicy: policy as never })
+    expect(instance.providerRetryPolicy('codebuddy')).toBe(policy)
+  })
+})
+

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "CodeBuddy Auth",
+    "description": "Sign in with your Tencent CodeBuddy account, see your remaining credits, and optionally route web search and fetch through the CodeBuddy gateway."
+  }
+}

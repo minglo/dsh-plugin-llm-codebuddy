@@ -1,0 +1,44 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # auto-tag 由 GITHUB_TOKEN 推 tag，其 push 事件不会触发本 workflow（防循环机制），
+  # 故由 auto-tag 打完 tag 后通过 gh workflow run 显式呼叫
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # OIDC：npm 侧已信任 GitHub Actions，无 token 也能发布
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          # 必须 >= node 24：OIDC trusted publishing 要求 npm >= 11.5.1，
+          # 而 node 22 早期版本自带的 npm 10.x 会静默回退到 token 认证后失败。
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # 先判重：已发布的版本无需再跑一遍门禁。
+      - name: Skip if already published
+        run: |
+          PKG="$(node -p "require('./package.json').name")"
+          VER="$(node -p "require('./package.json').version")"
+          if npm view "$PKG"@"$VER" version >/dev/null 2>&1; then
+            echo "version $VER already published, skip"
+            echo "skip=true" >> "$GITHUB_ENV"
+          fi
+      # 用 npm（而非 pnpm）发布：pnpm v11+ 的 publish 是自研实现，尚不支持 OIDC
+      # trusted publishing（pnpm/pnpm#9812）；npm CLI >= 11.5.1 才会自动检测 OIDC
+      # 环境并完成认证与 provenance 生成。
+      # 门禁由 package.json 的 prepublishOnly（typecheck + test + build）承担，
+      # 故此处不再重复显式跑一遍，避免同一个 gate 执行两次。
+      - run: npm publish --provenance
+        if: env.skip != 'true'
