@@ -4,10 +4,11 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, ResolvedRetryPolicy, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { deadline, idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
-import { CODEBUDDY_DISPLAY_NAME, CODEBUDDY_PRODUCT, CODEBUDDY_REPO_URL, REQUEST_TIMEOUT_MS } from './constants.js'
+import { CODEBUDDY_DISPLAY_NAME, CODEBUDDY_PRODUCT, CODEBUDDY_REPO_URL, PACKAGE_NAME, REQUEST_TIMEOUT_MS } from './constants.js'
 import { serializeRequest } from './serialize.js'
 import { NotLoggedInError, SessionUnavailableError } from './session.js'
 import type { CodeBuddySession } from './session.js'
+import { resetAtFromText } from './reset-time.js'
 import { parseSse } from './sse.js'
 import { translate } from './translate.js'
 import { hasDisclosedCapacity } from './types.js'
@@ -30,6 +31,11 @@ export interface CodeBuddyAdapterOptions {
    * BCP 47 标签；缺省按英文。
    */
   language?: () => string | undefined
+  /**
+   * 诊断出口（宿主日志）。只在「服务说稍后再试，却没说什么时候」时用一次：
+   * 那条日志留下服务当时到底发了什么，下次就能照实核对，而不必再猜。
+   */
+  warn?: (message: string) => void
 }
 
 import { createRequire } from 'node:module'
@@ -51,6 +57,46 @@ function providerRetryAfterMs(value: string | null): number | undefined {
   }
   const delay = Date.parse(value) - Date.now()
   return Number.isFinite(delay) && delay > 0 ? delay : undefined
+}
+
+/** 秒级时间戳 + 两侧时钟可能有偏差：多等 1 秒，不卡在重置边界的那一毫秒上。 */
+const RESET_MARGIN_MS = 1_000
+
+/**
+ * 读整个 body 为文本；读不出来时给 undefined——状态码本身仍能标识这次失败。
+ *
+ * 先整段读文本、再自己 `JSON.parse`，而不是 `response.json()`：重置时刻被服务写进
+ * 成句文案里（见 reset-time.ts），所以畸形 JSON 也必须能从中把它读出来。
+ * @param response - 非 2xx 回复。
+ * @returns body 原文，或读不出来时的 undefined。
+ */
+async function readBodyText(response: Response): Promise<string | undefined> {
+  try {
+    return await response.text()
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 服务报文里的重置时刻 → `providerRetryAfterMs`。
+ *
+ * 只认 429：那是「稍后再试」的状态码，而别的状态码报文里的日期更像叙述而非调度指令。
+ * @param status - 上游 HTTP 状态。
+ * @param body - 原始 body 文本。
+ * @param now - 计算等待时长的基准，可注入以便测试。
+ * @returns 距重置的毫秒数（含 {@link RESET_MARGIN_MS}）；读不出时刻时 undefined。
+ */
+function waitUntilResetMs(status: number, body: string | undefined, now: number = Date.now()): number | undefined {
+  if (status !== 429) return undefined
+  const resetAt = resetAtFromText(body, now)
+  return resetAt === undefined ? undefined : Math.max(1, resetAt - now + RESET_MARGIN_MS)
+}
+
+/** 诊断用的一行 body：太长就截断，读不出来时如实说明。 */
+function bodyForLog(body: string | undefined): string {
+  if (body === undefined) return '<unreadable body>'
+  return body.length <= 512 ? body : `${body.slice(0, 512)}…`
 }
 
 /**
@@ -145,6 +191,22 @@ export function httpErrorCode(status: number, detail?: string): string {
   }
   if (status >= 500) return 'SERVER'
   return `HTTP_${status}`
+}
+
+/**
+ * 失败码的最后一道判断：429 且服务给出了「何时可再试」= 限流，而不是额度用尽。
+ *
+ * 为什么不让措辞分类器抢这条：聊天界面按 code 把 QUOTA 换掉——`message.failure.quota`
+ * 是一句通用文案，服务写在 displayMsg 里的重置时刻会在界面上**消失**，而那个时刻
+ * 正是用户唯一能知道「还要等多久」的地方。限流既可重试，又保住了这句话。
+ * @param status - 非 2xx 状态。
+ * @param detail - 回复携带的全部错误措辞，可读时。
+ * @param resetWaitMs - 从报文里读出的到重置的等待；读不出时 undefined。
+ * @returns 归一化后的错误码。
+ */
+export function failureCode(status: number, detail: string | undefined, resetWaitMs: number | undefined): string {
+  if (status === 429 && resetWaitMs !== undefined) return 'RATE_LIMIT'
+  return httpErrorCode(status, detail)
 }
 
 /** 未登录（NotLoggedInError）统一映射为宿主唯一认识的 MISSING_CREDENTIAL 形状；其余错误原样上抛。 */
@@ -322,15 +384,25 @@ export class CodeBuddyAdapter extends LlmAdapter {
       } catch {
         // 语言只是装饰，失败本身不是。
       }
-      try {
-        failure = readWireFailure(await response.json() as WireError, language)
-        if (failure.message !== undefined) message = failure.message
-      } catch {
-        // 只吞错误 body 的解析失败：状态码仍能标识这次失败，畸形 JSON 不许把它盖掉。
+      const body = await readBodyText(response)
+      if (body !== undefined) {
+        try {
+          failure = readWireFailure(JSON.parse(body) as WireError, language)
+          if (failure.message !== undefined) message = failure.message
+        } catch {
+          // 只吞错误 body 的解析失败：状态码仍能标识这次失败，畸形 JSON 不许把它盖掉；
+          // 报文里的重置时刻照样读得出来——它就在这段文本里。
+        }
       }
+      // `Retry-After` 是明确的调度指令，优先采信；没有才去读文案里写的重置时刻。
       const delay = providerRetryAfterMs(response.headers.get('retry-after'))
+        ?? waitUntilResetMs(response.status, body)
+      if (response.status === 429 && delay === undefined) {
+        // 服务说「稍后再试」却没说什么时候：把它的原文留一行给运维，下一次有据可查。
+        this.config.warn?.(`${PACKAGE_NAME}: CodeBuddy 429 without a readable retry time: ${bodyForLog(body)}`)
+      }
       const id = requestId(response.headers)
-      throw new LlmError(message, httpErrorCode(response.status, failure.detail), {
+      throw new LlmError(message, failureCode(response.status, failure.detail, delay), {
         status: response.status,
         ...delay === undefined ? {} : { providerRetryAfterMs: delay },
         ...id === undefined ? {} : { requestId: id },

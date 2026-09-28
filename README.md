@@ -1,188 +1,151 @@
 # dsh-plugin-llm-codebuddy
 
-Tencent CodeBuddy LLM adapter for DeepSeek Harness.
+腾讯 CodeBuddy 的 DeepSeek Harness（`dsh`）适配插件。
 
-This plugin exposes Tencent CodeBuddy's model catalog and chat endpoint to DeepSeek
-Harness (`dsh`) as an LLM provider route named `codebuddy`. It is read-only: it
-reads the grant record and model catalog, streams chat completions, and refreshes
-the bearer token in place — it never creates or deletes grant records on its own.
+它把 CodeBuddy 的模型目录与对话端点接入 harness，注册为名为 `codebuddy` 的
+LLM 路由，让你的 CodeBuddy 账号额度直接用于 `dsh` 里的对话。插件是**只读**的：
+读取凭据与目录、流式对话、按需刷新令牌，不会自行创建或删除凭据。
 
-## Install
+## 安装
+
+`dsh plugin` 会把参数转交给该 profile 目录下的 pnpm，因此安装就是一次 pnpm 安装：
 
 ```sh
-dsh plugin add dsh-plugin-llm-codebuddy
+dsh plugin --profile web add dsh-plugin-llm-codebuddy
 ```
 
-## Credentials
+从本地目录或打包产物安装（发布到 npm 之前用这种方式）：
 
-CodeBuddy authenticates with a browser-issued bearer token. The adapter reads the
-grant record `plugin-llm-codebuddy/codebuddy` from the credentials seam
-(`@deepseek-ai/dsh-credentials`); the bearer token is NOT provided as a config
-value and is never persisted to disk by this plugin.
+```sh
+pnpm pack                                  # 产出 dsh-plugin-llm-codebuddy-<版本>.tgz
+dsh plugin --profile web add /绝对路径/dsh-plugin-llm-codebuddy-<版本>.tgz
+```
 
-The token reaches that record through the **AuthorizationFlow** login: a
-browser sign-in writes the `plugin-llm-codebuddy/codebuddy` grant record
-directly (see `dsh-codebuddy` authorization flow).
+装好后重启 `dsh web`（或让 profile 重新加载）生效。
 
-If no grant record exists, model listing degrades to an empty list (browsing
-semantics), while an actual request fails with `MISSING_CREDENTIAL`. When the
-access token is near expiry the session refreshes it against the CodeBuddy auth
-endpoint; refresh failures do not delete the record, and the record is only
-reported missing once the refresh token itself has expired.
+## 登录
 
-## Configuration
+CodeBuddy 使用浏览器签发的令牌认证。安装后在
+**设置 → 插件 → CodeBuddy** 里点「登录」，浏览器完成授权即可；令牌写入 harness
+的凭据存储，不作为配置项，也不会被本插件另存一份。
 
-The plugin's `Config` schema (schemastery) accepts these optional fields:
+- 未登录时模型列表为空，实际发起请求会以「缺少凭据」失败。
+- 访问令牌临近过期会自动刷新；刷新失败**不会**删除凭据，只有刷新令牌本身也过期
+  才会提示重新登录。
 
-| Field | Default | Meaning |
+## 配置
+
+| 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `baseURL` | `https://copilot.tencent.com/v2` | Chat-plane base URL (trailing slashes stripped). |
-| `defaultContextWindow` | `128000` | Context window for models the catalog does not size. |
-| `defaultMaxTokens` | `8192` | Max output tokens for models the catalog does not size. |
-| `streamIdleTimeoutMs` | `300000` | Idle watchdog timeout for the chat stream. |
+| `baseURL` | `https://copilot.tencent.com/v2` | 对话接口地址。 |
+| `defaultContextWindow` | `128000` | 目录未标注容量的模型所用上下文窗口。 |
+| `defaultMaxTokens` | `8192` | 目录未标注容量的模型所用最大输出。 |
+| `streamIdleTimeoutMs` | `300000` | 对话流的空闲超时。 |
 
-`baseURL` must be non-empty; the numeric fields must be positive (the context and
-token defaults must be positive integers, `streamIdleTimeoutMs` a positive finite
-number). Bad values fail loudly at load time. Requests are sent to
-`<baseURL>/chat/completions` as SSE (`stream: true`) with
-`stream_options.include_usage: true`.
+## 模型目录
 
-## Web search and fetch backends
+模型来自 CodeBuddy 的目录接口，会随服务端编辑自动更新，无需重启。只在目录里
+**标注了容量**（上下文与最大输出均为正）的模型才会出现在选择器中；未标注容量的
+条目不出现在列表里，但仍可用模型 id 直接指定，此时按上面的默认值保守处理。
 
-The plugin can back the stock `web_search` / `web_fetch` tools with the CodeBuddy
-gateway's own `/agenttool/v1/search` and `/agenttool/v1/webfetch` endpoints,
-reusing the same signed-in grant as chat. No extra credential is needed.
+## 用量额度
 
-**Settings → Plugins → CodeBuddy → "Search with CodeBuddy"** turns this on. The
-switch appears **only while signed in**: with no grant the plugin registers no
-provider at all, so a switch there could not do anything.
+插件提供三个入口查看账号额度，数据同源，因此任何两处显示的数字都不会互相矛盾。
 
-| Aspect | Behaviour |
+### 侧栏指示器（默认关闭）
+
+侧栏底部用两条进度条回答「还剩多少、还能自由花多少」：
+
+- **第一条「本月剩余」**：灰轨是总剩余，高亮段是**本月内到期**的那部分，条长就是
+  本月剩余占总剩余的比例——一眼看出「总剩看着不少，本月能自由花的只是一小段」。
+  右侧数字是**本月消耗率**，消耗率越高颜色在同一灰蓝色系内越深。
+- **第二条「最近剩余」**：把未来到期的额度按 ≤1 天 / 1–2 天 / 2–7 天分成三段，
+  每段宽度按该档额度分配，段内实心部分是该档的已用比例。没有任何短期到期额度时
+  整条隐藏。
+
+悬停可看到本月已用/额度、本月剩余、总剩余，以及每个到期段的精确数值。
+
+默认关闭是因为侧栏底部是常驻区域，加进度条会改变默认界面。
+
+### 输入框额度胶囊（默认开启）
+
+输入框工具行、模型选择器左侧显示 `CodeBuddy · 本月 xx%`，点击打开完整明细。
+**只在当前选中 CodeBuddy 模型时出现**——额度是 CodeBuddy 账号的属性，用别的
+provider 时它既无意义也不该占位。
+
+### 同心圆环
+
+插件详情页与胶囊弹窗展示同一套同心圆环，中心与三环由内向外分别是：
+
+| 位置 | 内容 |
 | --- | --- |
-| Default | **Off.** Installing the plugin never silently takes over the search slot. |
-| Effect timing | Live — no `dsh web` restart. |
-| Scope | One switch controls both `web_search` and `web_fetch`. |
-| Sign-out | Releasing is automatic: the backends unregister as soon as the grant is cleared. |
-| Sign-in | Re-acquiring is automatic once a grant exists and the switch is on. |
+| 中心 | 总剩余积分 |
+| 内环 | 已用积分（占总额度的比例） |
+| 中环 | 本月到期（占本月额度的比例） |
+| 外环 | **未来 7 天**，按天分段 |
 
-### Confirming which backend a search actually used
+三个环是同一种读法：**空轨表示未使用，彩色弧表示已使用，弧长就是已用的比例**。
+分段环也不例外——每一天未用的部分与另外两环同一个底色，只有已用的部分才是
+**当天自己的颜色**，所以七个环段彼此可分辨，一眼能看出「哪几天有额度、各用了多少」。
 
-The switch states **intent**; it does not prove the takeover happened. A badge on
-the search switch row states **effect**, read from the seam's own
-`searchProviderId` field — the exact value `web_search` / `web_fetch` dispatch on:
+按天分段的宽度按当天**发放的额度**分配，段与段之间留有空隙。**当天没有发放额度**
+是特殊情况：它不画彩色弧，只留一小段很淡的占位，既让七个位置保持稳定（便于记住
+「第几天」），又不会让人误以为那天有额度可花；图例里也会显式写「—」而不是 `0 / 0`。
 
-| Badge | Meaning |
+打开或数据刷新时，三个环会从零顺时针生长出来，并逐环错开；如果你在系统里设置了
+「减少动态效果」，动画会被跳过，静态图形照常显示。
+
+### 读数时效
+
+额度读数由宿主向 CodeBuddy 拉取，**每 60 秒刷新一次**；界面每 10 秒取一次读数，
+所以宿主刷好后约 10 秒内即可看到新值，但数字本身最多会有 60 秒旧。弹窗底部标注的
+是前者。
+
+同账号的重复读取由宿主缓存吸收：多个入口、多次重开面板或刷新页面都不会各自再打
+一次 CodeBuddy，只有缓存过期后才在后台刷新一次。
+
+## 用 CodeBuddy 接管网页搜索与抓取
+
+开启后，harness 内置的 `web_search` 与 `web_fetch` 会改走 CodeBuddy 网关，
+复用同一个账号，不需要额外凭据。
+
+开关在 **设置 → 插件 → CodeBuddy → 「使用 CodeBuddy 搜索」**，且**只在已登录时
+出现**（未登录时插件根本不注册相关后端，开关无从生效）。
+
+| 行为 | 说明 |
 | --- | --- |
-| **CodeBuddy search active** (green) | The selection field points at this plugin: searches really go to the CodeBuddy gateway. |
-| **Search not taken over** (grey) | Deliberate opt-out, or signed out — the field belongs to another provider (or to none). |
-| **Takeover not in effect** (amber) | Enabled *and* signed in, yet the takeover did not happen: no `web` service, a host that does not expose the selection fields, or a rejected registration. |
+| 默认值 | **关闭**。安装插件不会静默抢走搜索位。 |
+| 生效时机 | 即时，无需重启。 |
+| 范围 | 一个开关同时控制搜索与抓取。 |
+| 退出登录 | 自动释放，不影响其他搜索提供方。 |
+| 重新登录 | 开关仍为开时自动恢复接管。 |
 
-The badge distinguishes the last two on purpose: without it, "the switch is on
-but had no effect" is indistinguishable from "the switch is off". It is read on
-every `status()` call and refreshed right after you move the switch, so it never
-shows a stale backend. If a third party claims the slot while this plugin is
-live, the badge stops claiming CodeBuddy — it follows the field, not the plugin's
-own registration state.
+开关旁有一枚**生效态徽标**，用来区分「开关想怎样」和「实际怎样」：
 
-The badge sits on the plugin's settings card (`Settings → Plugins → CodeBuddy`)
-next to the switch, and appears only while signed in, the same condition under
-which the search row itself is shown.
+| 徽标 | 含义 |
+| --- | --- |
+| **CodeBuddy 搜索生效中**（绿） | 搜索确实走 CodeBuddy 网关。 |
+| **未接管搜索**（灰） | 你主动关掉了，或未登录。 |
+| **接管未生效**（琥珀） | 开关已开且已登录，但接管没成立（宿主未提供相关能力等）。 |
 
-Reading `status()` also performs a **self-healing resync**: the plugin asks
-whether the takeover is live, and if not, re-reads the login state before
-reporting. This matters because the grant may already exist on disk at boot while
-the credential service is not readable yet — and a pre-existing grant emits **no**
-`credentials/record-updated` event, so nothing else would ever correct an
-initially-wrong login reading. Without this, "switch on + signed in" could stick
-at "not taken over" until the whole `dsh web` process restarted. The resync is a
-no-op once live, and skipped entirely while the switch is off.
+没有这枚徽标时，「开关开着却没生效」与「开关是关的」看起来一模一样。接管通过
+运行时选择实现，关闭时会**还原成原来那个提供方**，因此可以和其他搜索插件共存。
 
-A per-result attribution label on the `web_search` tool cards is **not** possible
-from this plugin: `WebSearchSource` (`url`/`title`/`snippet`/`publishedAt`) and
-`WebSearchProvider` (`id`/`available()`/`search()`) carry no provider field into
-the rendering layer, and `dsh-tool-web` exposes no decoration slot. That would
-need an upstream change.
+## 遇到频率限制时会等到重置
 
-Selection is taken over at **runtime**, never by pinning `web.searchProvider` in
-`cordis.patch.yml`. Pinning would replace the whole `web` row config and
-permanently steal the default slot from other providers (for example a
-free-search plugin); instead the plugin remembers whatever occupied the slot,
-takes it over while enabled, and restores that exact value on release — without
-hardcoding any provider id, so it cooperates with any third-party backend. If a
-different provider claims the slot while this plugin is live, the release leaves
-that newer choice alone.
+当账号额度被限流，CodeBuddy 返回 `429`，并在提示里给出重置时刻（例如
+「将在 2026-09-27 17:30:18 UTC+8 重置」）。插件会读出这个时刻，
+**等到那个时间点再自动重试**，而不是立刻连续重试几次就失败。
 
-Takeover writes `searchProviderId` / `fetchProviderId`, which upstream `dsh-web`
-declares `private readonly`. That is a deliberate, documented reach past the type
-system, not a supported upstream seam: every official provider package
-(`web-search-exa`, `-deepseek`, `-perplexity`, `web-fetch-http`, `tool-web`) only
-calls `registerXxxProvider` — none reads or writes these fields. It is necessary
-here because the seam resolves selection as *pinned id first, else the single
-available provider*, and `dsh-base` plus most provider plugins do pin
-`web.config.searchProvider`, so a register-only backend would never be selected
-at all.
+- 等待上限 24 小时：当天内的重置都会等；隔夜等更久的则立即报错，并保留重置时刻。
+- 等待过程在对话里有一条可展开的倒计时提示，说明第几次重试与失败原因，随时可中断。
+- 提示里的重置时间会原样保留，不会因为错误分类而丢失。
 
-If those fields are absent (a future host that truly seals them), the plugin
-registers nothing rather than registering without taking over: in an unpinned
-composition a second available provider makes the seam raise
-`WEB_PROVIDER_AMBIGUOUS` for *everyone*, so register-only would turn this
-plugin's own no-op into a global search outage. Not registering never harms
-another provider — it only leaves this backend unusable, which is what it would
-have been anyway.
+## 尚未支持
 
-When the `web` service is absent or registration is rejected (duplicate id), the
-plugin likewise logs a warning and degrades gracefully rather than failing to
-load.
+- 命令行登录命令。
+- 目录与用户自定义模型条目的合并。
 
-Because the gateway relays fetches on the server side, an unresolvable or blocked
-target surfaces as a gateway error code (for example `15018` for a blocked host)
-rather than a local network error.
+## 许可证
 
-## Model catalog
-
-Models are advertised from the advisory `/v3/config` catalog. An entry is only
-shown when it discloses capacity (both `maxAllowedSize` and `maxOutputTokens` are
-positive); entries without disclosed capacity are hidden from the picker but can
-still be routed explicitly. Explicit ids outside the catalog resolve to a
-conservative text-only shape using the configured defaults.
-
-## User agent
-
-Requests carry a white-label attribution header `dsh-codebuddy/<version>
-(+https://github.com/minglo/dsh-plugin-codebuddy)`. The harness default identity is
-deliberately not used (the upstream endpoint rejects it), and the plugin does not
-impersonate the CodeBuddy CLI/IDE user agent.
-
-## Usage metering (sidebar indicator)
-
-The sidebar footer action shows one composite bar over **total remaining
-credits** (`totalBalance`): the highlighted segment is the **remaining credits
-that expire this month** (`monthPoolRemain` = sum of `CycleEndTime`-this-month,
-unexpired packages). The figure beside it is the **monthly consumption rate**
-(`monthPool.used / monthPool.size`), so early-month heavy use turns the color
-from green to orange/red while a low rate late in the month reads green. Hover
-reveals three absolute numbers: remaining this month, used/size this month, and
-total remaining.
-
-Hosts that predate `monthPool` (missing the field entirely) render the bar from
-`totalBalance` alone and treat the monthly fields as zero — no crash, degraded
-view. The legacy `monthly` bucket (which excluded the ≤7-day window) has been
-removed: the settings card and the sidebar indicator both read `monthPool`, a
-single accounting basis.
-
-## Deferred
-
-Not implemented in this MVP:
-
-- **Usage metering** (`/v2/billing/meter/*`).
-- **AuthorizationFlow login** — the grant record key is the intended write target;
-  the codebuddy login flow requires an `authorization` seam (headless setups sign
-  in through the client settings card instead).
-- **Client settings page** (`dsh.client` + settings section).
-- **CLI login command** (`dsh-codebuddy-login`).
-- **Catalog/user-config merge** — merging the `/v3/config` cache with user-edited
-  model entries (user wins) once settings are wired up.
-
-## License
-
-MIT — see [LICENSE](./LICENSE).
+MIT，见 [LICENSE](./LICENSE)。

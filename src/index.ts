@@ -9,6 +9,7 @@ import type { CodeBuddyConnectionOptions } from './adapter.js'
 import { CodeBuddySession } from './session.js'
 import { CodeBuddyRemoteService } from './remote.js'
 import { configureSettingsPage, readSettings } from './settings-ns.js'
+import type { CodeBuddySettings } from './settings-ns.js'
 import { CodeBuddyWebSync, gatewayRootOf } from './web-sync.js'
 import { registerCodeBuddyFlow } from './login-flow.js'
 import { CODEBUDDY_CHAT_BASE, CODEBUDDY_PROVIDER, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, PACKAGE_NAME, PLUGIN_NAME } from './constants.js'
@@ -21,10 +22,28 @@ export interface Config {
   defaultContextWindow?: number
   defaultMaxTokens?: number
   streamIdleTimeoutMs?: number
-  /** provider 自持的重试策略；省略即宿主默认。 */
+  /**
+   * provider 自持的重试策略。
+   *
+   * 省略时**不是**宿主的默认策略，而是本插件的一份默认：可重试集合、重试次数、
+   * 初始退避与抖动都与宿主 normal 默认逐项相同，只把 `backoff.maxDelayMs` 抬高。
+   * 原因见 {@link DEFAULT_RETRY_MAX_DELAY_MS}：`providerRetryAfterMs` 只在
+   * ≤ `maxDelayMs` 时才被采纳，而服务给出的重置时刻常在几十分钟之后。
+   */
   retryPolicy?: RetryPolicyConfig
-  /** 侧边栏用量指示器。0.1.7 起声明为本插件自己的 volatile Config 字段。 */
+  /**
+   * 侧边栏底部用量指示器。0.1.7 起声明为本插件自己的 volatile Config 字段。
+   * 默认 **false**：侧栏底部是常驻状态区，加一条进度条会改变默认界面。
+   */
   showUsage?: boolean
+  /**
+   * 输入框工具行里的额度胶囊（模型选择器左侧）。
+   * 默认 **true**：只在选中 CodeBuddy 模型时出现，属按需出现的上下文入口。
+   *
+   * 必须与 {@link SettingsSchema} 的默认值一致：loader 用本 schema 校验并在
+   * `readSettings` 之前填好缺省，两处不一致会让界面默认值与设置页显示分裂。
+   */
+  showComposerUsage?: boolean
   /**
    * 用 CodeBuddy 网关的搜索/抓取后端接管 web_search / web_fetch。
    * 默认 false：装了插件即静默抢走别人的默认搜索位是破坏性默认值。
@@ -37,14 +56,59 @@ export const Config = z.object({
   defaultContextWindow: z.number().default(DEFAULT_CONTEXT_WINDOW),
   defaultMaxTokens: z.number().default(DEFAULT_MAX_TOKENS),
   streamIdleTimeoutMs: z.number().default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
-  // schemastery 的对象字段默认可选，无需 .optional()；省略即宿主默认策略。
+  // schemastery 的对象字段默认可选，无需 .optional()。省略**不等于**宿主默认策略：
+  // resolveConnectionOptions 会补上本插件那份默认（见 defaultRetryPolicyConfig）。
   retryPolicy: RetryPolicySchema,
-  // 两个用户开关都是 volatile：loader 的 _commitVolatile 在不重挂插件的前提下
+  // 三个用户开关都是 volatile：loader 的 _commitVolatile 在不重挂插件的前提下
   // 就地提交变更（并发 loader/volatile-update），webSync 据此实时注册/注销
   // provider，切开关不再打断进行中的会话。
-  showUsage: z.boolean().default(true).volatile(),
+  //
+  // 这三个字段是本插件配置面的**权威来源**：`updateSettings` 把 `set` op 写进
+  // profile patch 后由 loader 用本 schema 校验回灌，`readSettings` 再从句柄取值。
+  // 因此字段一旦漏在这里，写入会被 loader 丢弃、读取永远落到兜底值——设置页的
+  // 开关看起来能切，实际不生效。默认值也必须与 settings-ns.ts 的 DEFAULT_SETTINGS
+  // 一致（见那里的说明）。
+  showUsage: z.boolean().default(false).volatile(),
+  showComposerUsage: z.boolean().default(true).volatile(),
   webSearch: z.boolean().default(false).volatile(),
 })
+
+/**
+ * 省略 `retryPolicy` 时的等待上限。
+ *
+ * 为什么不沿用宿主的 10 秒默认：`providerRetryAfterMs` 只在 ≤ `maxDelayMs` 时才被
+ * 采纳（裁决在 @deepseek-ai/dsh-llm-retry），而 CodeBuddy 在用量被限流时给出的重置
+ * 时刻常在几十分钟之后——2026-09-27 实测：16:20 的 429 让等到 17:30，约 70 分钟。
+ * 用宿主默认，这个读数会被直接丢弃 → 立刻失败；而这里要的是「到点再试」。
+ *
+ * 取 24 小时：一天以内的等待都按服务说的时刻重试；更远的（例如隔夜整夜）宁可立刻
+ * 报错并保留重置时间——那种等待不该由一个回合承担。要改就设
+ * `retryPolicy.backoff.maxDelayMs`。
+ *
+ * 对**本地**退避没有影响：次数默认 5、初始 500ms，第 5 次也只有 500ms×2⁴ ≈ 8 秒，
+ * 远低于这个上限，所以普通抖动的行为与宿主默认逐字相同。
+ */
+const DEFAULT_RETRY_MAX_DELAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * 省略 `retryPolicy` 时本插件自持的默认策略。
+ *
+ * 逐项照搬宿主 normal 默认（而不是照抄一份常量）：宿主的可重试集合若在某次升级里
+ * 变化，这里跟着变，不会悄悄落后。宿主契约里省略配置就是 normal，`always` 分支只为
+ * 让类型收得住。
+ * @returns 一份可直接交给 {@link resolveRetryPolicy} 的配置。
+ */
+function defaultRetryPolicyConfig(): RetryPolicyConfig {
+  const base = resolveRetryPolicy(undefined, `${PACKAGE_NAME}: retryPolicy`)
+  const backoff = {
+    initialDelayMs: base.initialDelayMs,
+    maxDelayMs: DEFAULT_RETRY_MAX_DELAY_MS,
+    jitterRatio: base.jitterRatio,
+  }
+  return base.mode === 'always'
+    ? { mode: 'always', backoff }
+    : { mode: 'normal', maxRetries: base.maxRetries, retryableCodes: [...base.retryableCodes], backoff }
+}
 
 export function resolveConnectionOptions(config: Config = {}): CodeBuddyConnectionOptions {
   const positiveInteger = (value: number | undefined, field: string, fallback: number): number => {
@@ -67,7 +131,7 @@ export function resolveConnectionOptions(config: Config = {}): CodeBuddyConnecti
     defaultContextWindow: positiveInteger(config.defaultContextWindow, 'defaultContextWindow', DEFAULT_CONTEXT_WINDOW),
     defaultMaxTokens: positiveInteger(config.defaultMaxTokens, 'defaultMaxTokens', DEFAULT_MAX_TOKENS),
     streamIdleTimeoutMs,
-    retryPolicy: resolveRetryPolicy(config.retryPolicy, `${PACKAGE_NAME}: retryPolicy`),
+    retryPolicy: resolveRetryPolicy(config.retryPolicy ?? defaultRetryPolicyConfig(), `${PACKAGE_NAME}: retryPolicy`),
   }
 }
 
@@ -101,7 +165,13 @@ const LOCALE_ENTRY_ID = 'locale'
 export function apply(ctx: Context, config: Config = {}): void {
   const resolved = resolveConnectionOptions(config)
   const session = new CodeBuddySession(ctx)
-  const adapter = new CodeBuddyAdapter({ session, options: () => resolved, language: currentLanguage(ctx) })
+  const adapter = new CodeBuddyAdapter({
+    session,
+    options: () => resolved,
+    language: currentLanguage(ctx),
+    // 诊断出口接宿主日志：适配器只在「服务说稍后再试却没说什么时候」时用一次。
+    warn: (message) => { ctx.logger.warn(message) },
+  })
   ctx.llm.registerAdapter([CODEBUDDY_PROVIDER], adapter)
 
   // 设置页策略：不自动生成本 entry 的表单页（卡片是手写的 plugins.item 槽）。
@@ -110,7 +180,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   // 设置开关的权威值读 apply 收到的 config：它与 fiber.config 是**同一个对象**
   //（volatile 引用也共享同一实例，loader 提交后两边同步），而 Remote 方法里的
   // this.ctx 绑到调用方上下文，读不到本插件 fiber——所以从这里把句柄传下去。
-  const settingsOf = (): { showUsage: boolean; webSearch: boolean } => readSettings(config)
+  const settingsOf = (): CodeBuddySettings => readSettings(config)
 
   // 目录编辑会改变本路由对外宣称的模型。Web 客户端据以渲染 provider 分组的
   // harness 目录是**客户端侧缓存**的，只在 `llm/adapters-updated`（或设置与凭据事件）

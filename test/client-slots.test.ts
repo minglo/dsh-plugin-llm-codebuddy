@@ -26,6 +26,8 @@ import { PACKAGE_NAME } from '../src/constants.js'
 interface Registration {
   name: string
   key?: string
+  id?: string
+  order?: number
   locale?: string
 }
 
@@ -102,6 +104,32 @@ describe('client slot registration', () => {
     expect(registered.some(entry => entry.name === 'sidebar.footer.action')).toBe(true)
   })
 
+  it('contributes the composer allowance pill to the standard conversation.input.right list slot', async () => {
+    // `conversation.input.right` 是 ui-conversation 声明的 list 槽（replaceRisk: none），
+    // 渲染在 composer 的 standardControls 里、模型选择器**之前**。注册必须
+    // 带自己的 id：复用别人的 id 会把那个 occupant 顶掉（官方契约原文），
+    // 而本插件只是又一个用量胶囊，没有理由遮蔽 opencode-go 之类的同伴。
+    const { registered, settle } = mountHarness()
+    await settle()
+    const pill = registered.find(entry => entry.name === 'conversation.input.right')
+    expect(pill).toBeDefined()
+    expect(pill?.id).toBe('llm-codebuddy-usage')
+    // 侧栏指示器用 id 10；胶囊排在其后，两者互不干扰（不同 slot，order 只在槽内比较）。
+    expect(pill?.order).toBe(20)
+  })
+
+  it('never claims a single-kind composer seat, which would shadow shipped UI', async () => {
+    // conversation.input.model / .plan / .permission / .activity 都是 kind: single：
+    // 注册进去等于替换官方控件（replaceRisk: shadows-shipped-ui）。用量胶囊是增量
+    // 装饰，不属于任何这些座位。
+    const { registered, settle } = mountHarness()
+    await settle()
+    for (const key of ['conversation.input.model', 'conversation.input.plan',
+      'conversation.input.permission', 'conversation.input.activity'] as const) {
+      expect(registered.some(entry => entry.name === key), key).toBe(false)
+    }
+  })
+
   it('withholds the config entry when the host does not serve the settings namespace', async () => {
     // whileServed 守卫只针对配置槽：宿主没暴露本 entry 的 settings 命名空间时，
     // 不注册那块永远渲染不出的配置；侧栏用量指示器与本 entry 无关，照常注册。
@@ -109,6 +137,8 @@ describe('client slot registration', () => {
     await settle()
     expect(registered.some(entry => entry.name === 'plugins.bundle.config')).toBe(false)
     expect(registered.some(entry => entry.name === 'sidebar.footer.action')).toBe(true)
+    // 输入框胶囊与 settings 命名空间无关：宿主不服务配置页时它照样注册。
+    expect(registered.some(entry => entry.name === 'conversation.input.right')).toBe(true)
   })
 })
 

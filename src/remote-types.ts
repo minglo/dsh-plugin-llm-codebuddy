@@ -41,10 +41,26 @@ export interface LoginPoll {
 export interface UsageResult {
   loggedIn: boolean
   view?: UsageView
+  /**
+   * 该读数的**抓取时刻**（宿主时钟，毫秒）。
+   *
+   * 由宿主给而不是客户端 `Date.now()`：宿主缓存会让一次抓取服务多个入口与
+   * 多次重挂，各客户端各自打时间戳会把同一份读数标成不同时间。可选——旧宿主
+   * 不发它，客户端回落到「本次读到」的时刻。
+   */
+  fetchedAt?: number
 }
 
 export interface SettingsView {
   showUsage: boolean
+  /**
+   * 提示输入框工具行里的额度胶囊（模型选择器左侧）。
+   *
+   * optional 是刻意的：host 与 client 是两个独立产物（浏览器 bundle 可经 HMR
+   * 单独替换），旧 host 不发这个字段时客户端必须能 decode 成功并按默认值处理，
+   * 而不是让整张配置卡片因解码失败而消失。见 status.searchBackend 的同款取舍。
+   */
+  showComposerUsage?: boolean
   /** 是否用 CodeBuddy 后端接管 dsh 的 web_search / web_fetch。 */
   webSearch: boolean
 }

@@ -1,12 +1,14 @@
-import { useEffect, useState, createElement as h } from 'react'
+import { useEffect, useState, useSyncExternalStore, createElement as h } from 'react'
 import type { HTMLAttributes, ReactNode } from 'react'
 import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { SettingsView, UsageResult } from '../remote-types.js'
-import { subscribeLoginChange, subscribeUsagePrefChange } from './CodeBuddyTab.jsx'
-import { finiteOr, formatCredits, unwrap, withTimeout } from './shared.js'
-import { monthColor, SEGMENT_COLORS, tint } from './palette.js'
+import { subscribeUsagePrefChange } from './notifiers.js'
+import { formatCredits, unwrap } from './shared.js'
+import { monthColor, tint } from './palette.js'
+import { toReading } from './usage-metrics.js'
+import { EMPTY_USAGE_SNAPSHOT, usageFeed, type UsageSnapshot } from './usage-feed.js'
 
 export interface UsageIndicatorInjected {
   remote: {
@@ -17,8 +19,6 @@ export interface UsageIndicatorInjected {
 }
 
 type Props = PropsRuntime<'sidebar.footer.action'> & InjectFace<UsageIndicatorInjected>
-
-const READ_TIMEOUT_MS = 15_000
 
 /** 段太窄时不渲染段内百分比：截断的「5(」比留白更难读，精确值仍在 tooltip 里。
  * 侧栏展开态两条合计约 160px，扣除三段间隙后每段能容纳「100%」的最小占比约 18%。
@@ -42,133 +42,35 @@ const s = {
 }
 
 /** 侧边栏读数：总剩余 + 本月到期池 + 派生占比 + 互斥到期段。 */
-interface UsageReading {
-  /** 总剩余（未过期包余额合计）。 */
-  totalBalance: number
-  /** 本月到期池剩余（月底前不用就清零的部分）。 */
-  monthRemain: number
-  /** 本月已用 / 池 size（月度消耗率）。 */
-  monthUsed: number
-  monthSize: number
-  monthUsedRatio: number
-  /** 复合条：本月段占「总剩余」的宽长比例（clamp [0,1]）。 */
-  monthShare: number
-  /** 第二条复合条的三段（互斥区间，size>0 的才保留）。 */
-  expiring: ExpiringSegment[]
-}
-
-/** 一个互斥到期段：`≤1天` / `1–2天` / `2–7天`。 */
-interface ExpiringSegment {
-  /** locale 键（段名，仅在 tooltip 展示）。 */
-  key: string
-  used: number
-  size: number
-  /** used / size，clamp [0,1]。 */
-  usedRatio: number
-  /** 段宽占整条的比例：按该段额度大小分配。 */
-  share: number
-  color: string
-}
-
-/**
- * 把 host 的**累计**窗口（7天 ⊇ 2天 ⊇ 1天）折成**互斥**三段。
- *
- * 累计值直接当三段用会重复计数（同一包在 ≤2天与 ≤7天里各算一次），且三段之和不等于
- * 任何有意义的整体。相邻两档相减即得互斥区间，且因同源同口径，相减不会遗漏或重复。
- */
-export function exclusiveSegments(view: UsageResult['view']): ExpiringSegment[] {
-  if (view === undefined) return []
-  const cumulative = [
-    { key: 'expiringWithin1d', bucket: view.tomorrow },
-    { key: 'expiring1to2d', bucket: view.dayAfter },
-    { key: 'expiring2to7d', bucket: view.week },
-  ]
-  const raw = cumulative.map(({ key, bucket }, index) => ({
-    key,
-    index,
-    used: finiteOr(bucket?.used, 0),
-    size: finiteOr(bucket?.size, 0),
-  }))
-  // 相邻相减并夹到非负：host 数据异常（后档小于前档）时按 0 处理，不产出负宽段。
-  const exclusive = raw.map((segment, position) => {
-    const previous = position === 0 ? undefined : raw[position - 1]
-    return {
-      key: segment.key,
-      index: segment.index,
-      used: Math.max(segment.used - (previous?.used ?? 0), 0),
-      size: Math.max(segment.size - (previous?.size ?? 0), 0),
-    }
-  })
-  const kept = exclusive.filter(segment => segment.size > 0)
-  const total = kept.reduce((sum, segment) => sum + segment.size, 0)
-  return kept.map(segment => ({
-    key: segment.key,
-    used: segment.used,
-    size: segment.size,
-    usedRatio: segment.size > 0 ? Math.min(Math.max(segment.used / segment.size, 0), 1) : 0,
-    share: total > 0 ? segment.size / total : 0,
-    color: SEGMENT_COLORS[segment.index % SEGMENT_COLORS.length] ?? SEGMENT_COLORS[0],
-  }))
-}
-
-/**
- * 归一化 host 返回的 view：host 与 client 是两个独立产物（tsc / tsup 分别产出），
- * 只重建其一就会拿到缺字段的旧结构（如无 totalUsed / monthPool）。这里按「有则取、
- * 无则按剩余口径兜底」消化，避免一次版本错配让整个侧边栏抛 Cannot read properties of undefined。
- * 旧 host（无 monthPool）退化为「仅总剩余」，复合段与月度消耗率按 0 兜底、不抛。
- */
-function toReading(view: UsageResult['view']): UsageReading | undefined {
-  if (view === undefined) return undefined
-  const totalBalance = view.totalBalance !== undefined ? finiteOr(view.totalBalance, 0) : finiteOr(view.totalSize, 0)
-  const pool = view.monthPool
-  const monthSize = pool !== undefined ? finiteOr(pool.size, 0) : 0
-  const monthUsed = pool !== undefined ? finiteOr(pool.used, 0) : 0
-  const monthRemain = view.monthPoolRemain !== undefined
-    ? finiteOr(view.monthPoolRemain, 0)
-    : pool !== undefined ? finiteOr(pool.expiring, 0) : 0
-  const monthUsedRatio = monthSize > 0 ? Math.min(Math.max(monthUsed / monthSize, 0), 1) : 0
-  const monthShare = totalBalance > 0 ? Math.min(Math.max(monthRemain / totalBalance, 0), 1) : 0
-  return { totalBalance, monthRemain, monthUsed, monthSize, monthUsedRatio, monthShare, expiring: exclusiveSegments(view) }
-}
-
 export function UsageIndicator({ remote, t, wide }: Props): ReactNode {
-  const [showUsage, setShowUsage] = useState<boolean>(true)
-  const [reading, setReading] = useState<UsageReading | undefined>(undefined)
-  const [refreshKey, setRefreshKey] = useState<number>(0)
+  // 初值与 schema 默认一致（**关**）：读取偏好前的首帧不能先显示出来再消失，
+  // 那会让默认关掉的用户看到一个闪烁的指示器。
+  const [showUsage, setShowUsage] = useState<boolean>(false)
 
   useEffect(() => {
-    void unwrap(remote.getSettings()).then(s => setShowUsage(s.showUsage)).catch(() => setShowUsage(true))
+    void unwrap(remote.getSettings())
+      // `?? false`：旧 host 不发该字段时按 schema 默认（关）处理。裸读会得到
+      // undefined，`showUsage ? ...` 判成假值虽然结果相同，但那属于巧合而非约定。
+      .then(s => setShowUsage(s.showUsage ?? false))
+      .catch(() => setShowUsage(false))
   }, [remote])
 
-  // C1：登录态变化（CodeBuddyTab 登录/退出成功后 emitLoginChange）立即重拉，
-  // 不等下一次 60s 轮询。
-  useEffect(() => subscribeLoginChange(() => setRefreshKey(k => k + 1)), [])
-
-  // 开关变化（设置页切换成功后 emitUsagePrefChange）：重读偏好并据此启停轮询。
+  // 开关变化（设置页切换成功后 emitUsagePrefChange）：重读偏好并据此启停订阅。
   useEffect(() => subscribeUsagePrefChange(() => {
-    void unwrap(remote.getSettings()).then(s => setShowUsage(s.showUsage)).catch(() => setShowUsage(true))
+    void unwrap(remote.getSettings())
+      .then(s => setShowUsage(s.showUsage ?? false))
+      .catch(() => setShowUsage(false))
   }), [remote])
 
-  useEffect(() => {
-    if (!showUsage) return
-    let stopped = false
-    const read = async (): Promise<void> => {
-      if (stopped) return
-      try {
-        const u = await withTimeout(unwrap(remote.usage()), READ_TIMEOUT_MS)
-        if (stopped || !u.loggedIn || u.view === undefined) { setReading(undefined); return }
-        // 与 showUsageDesc「已用额度进度」对齐：已用 ÷ 未过期奖励积分合计。
-        setReading(toReading(u.view))
-      } catch {
-        // 网关失败/本地故障：清空读数，等待下一轮轮询或登录态变化重试。
-        if (stopped) return
-        setReading(undefined)
-      }
-    }
-    void read()
-    const timer = window.setInterval(read, 60_000)
-    return () => { stopped = true; window.clearInterval(timer) }
-  }, [remote, showUsage, refreshKey])
+  // 读数来自共享 feed：与输入框胶囊同一次请求，不再各开一个定时器。
+  // 未显示时不订阅——开关关掉的入口不产生任何外呼，也不读共享读数。
+  const feed = usageFeed(remote)
+  const snapshot = useSyncExternalStore(
+    showUsage ? feed.subscribe : NO_SUBSCRIPTION,
+    showUsage ? feed.getSnapshot : noSnapshot,
+    showUsage ? feed.getSnapshot : noSnapshot,
+  )
+  const reading = snapshot.loggedIn ? toReading(snapshot.view) : undefined
 
   if (!showUsage || reading === undefined) return null
   const pct = Math.min(Math.max(reading.monthUsedRatio * 100, 0), 100)
@@ -221,3 +123,7 @@ export function UsageIndicator({ remote, t, wide }: Props): ReactNode {
     children: h('div', { style: s.rail } as HTMLAttributes<HTMLDivElement>, `${Math.round(pct)}%`),
   })
 }
+
+/** 关闭态：不订阅任何东西，也不读共享读数（开关关掉的入口零成本）。 */
+const NO_SUBSCRIPTION = (): (() => void) => () => {}
+const noSnapshot = (): UsageSnapshot => EMPTY_USAGE_SNAPSHOT

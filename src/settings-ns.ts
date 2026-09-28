@@ -12,8 +12,23 @@ export const SETTINGS_NS = 'plugin-llm-codebuddy'
 
 /** 本插件的配置面（与客户端卡片一一对应）。 */
 export interface CodeBuddySettings {
-  /** 侧边栏用量指示器。 */
+  /**
+   * 侧边栏底部指示器。
+   *
+   * **默认关**：侧栏底部是状态区，加一条常驻进度条会改变默认界面，
+   * 应当是显式选择而不是既成事实。
+   */
   showUsage: boolean
+  /**
+   * 提示输入框工具行里的额度胶囊（模型选择器左侧）。
+   *
+   * 与 `showUsage` 分成两个字段：两处入口的诉求不同——侧栏是常驻读数、
+   * 输入框旁是随手可点的明细入口，用户常常只想要其中一个。
+   *
+   * **默认开**：只在选中 CodeBuddy 模型时出现，是「按需出现、随手可点」
+   * 的上下文入口，不占常驻界面；因此默认提供。
+   */
+  showComposerUsage: boolean
   /**
    * 用 CodeBuddy 网关的搜索/抓取后端接管 dsh 的 web_search / web_fetch。
    * 默认 false：装了插件即静默抢走别人的默认搜索位是破坏性默认值。
@@ -22,19 +37,20 @@ export interface CodeBuddySettings {
 }
 
 /**
- * 两个开关都是 `.volatile()`：可变字段由 loader 在**不重挂插件**的前提下就地
+ * 三个开关都是 `.volatile()`：可变字段由 loader 在**不重挂插件**的前提下就地
  * 提交（`cordis-plugin-loader` 的 `_commitVolatile` → `loader/volatile-update`），
  * 于是切换开关不会重启 session、不会丢掉 web provider 的接管态。
  *
  * 默认值写在 schema 上：`.volatile()` 不吞 default，缺省即 schema 默认。
  */
 export const SettingsSchema = z.object({
-  showUsage: z.boolean().default(true).volatile(),
+  showUsage: z.boolean().default(false).volatile(),
+  showComposerUsage: z.boolean().default(true).volatile(),
   webSearch: z.boolean().default(false).volatile(),
 })
 
 /** 组合层缺省：schema 默认值之外的「官方入口默认」。 */
-export const DEFAULT_SETTINGS: CodeBuddySettings = { showUsage: true, webSearch: false }
+export const DEFAULT_SETTINGS: CodeBuddySettings = { showUsage: false, showComposerUsage: true, webSearch: false }
 
 /**
  * 声明本插件在设置页的策略：不自动生成表单页。
@@ -59,6 +75,7 @@ export function readSettings(config: unknown): CodeBuddySettings {
   const section = (config ?? {}) as Record<string, unknown>
   return {
     showUsage: booleanOr(section.showUsage, DEFAULT_SETTINGS.showUsage),
+    showComposerUsage: booleanOr(section.showComposerUsage, DEFAULT_SETTINGS.showComposerUsage),
     webSearch: booleanOr(section.webSearch, DEFAULT_SETTINGS.webSearch),
   }
 }

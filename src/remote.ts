@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { readGrant, recordKey } from './auth.js'
 import type { CodeBuddyGrant } from './auth.js'
 import { fetchUsage, UsageAuthExpiredError } from './usage.js'
+import { UsageCache, usageCacheKey } from './usage-cache.js'
 import { decodeJwtPayload, resolveIdentity } from './jwt.js'
 import { requestAuthState } from './codebuddy.js'
 import { completeLogin } from './login-flow.js'
@@ -10,6 +11,7 @@ import type { CodeBuddySession } from './session.js'
 import { readSettings, updateSettings } from './settings-ns.js'
 import type { CodeBuddySettings } from './settings-ns.js'
 import type { LoginPoll, LoginStart, SearchBackendState, SettingsView, StatusView, UsageResult } from './remote-types.js'
+import { USAGE_CACHE_TTL_MS } from './constants.js'
 
 export interface CodeBuddyRemoteOptions {
   session: CodeBuddySession
@@ -35,6 +37,12 @@ export interface CodeBuddyRemoteOptions {
 
 export class CodeBuddyRemoteService extends TypertRemoteService {
   private pending = new Map<string, Promise<CodeBuddyGrant | undefined>>()
+  /**
+   * 额度读数的宿主侧缓存。**一次抓取服务所有客户端入口与所有重挂**：
+   * 侧栏指示器、输入框胶囊、插件配置页读的是同一份，刷新页面或 HMR 重挂
+   * 也命中缓存而不是重打一轮多页外呼。
+   */
+  private readonly usageCache = new UsageCache({ ttlMs: USAGE_CACHE_TTL_MS })
 
   constructor(ctx: Context, private readonly options: CodeBuddyRemoteOptions) {
     super(ctx, 'codebuddy')
@@ -69,23 +77,37 @@ export class CodeBuddyRemoteService extends TypertRemoteService {
   @Remote
   async usage(): Promise<UsageResult> {
     const grant = await readGrant(this.ctx)
-    if (grant === undefined) return { loggedIn: false }
+    if (grant === undefined) {
+      // 未登录：丢弃缓存，避免登出后仍把上一个账号的额度发出去。
+      this.usageCache.clear()
+      return { loggedIn: false }
+    }
+    // 身份解析（可能触发 token 刷新）只做一次：它同时给出账号身份键与本次
+    // 外呼要用的凭据。用 uid + 企业 id 当键，**不用 token**——token 会随刷新
+    // 轮换，拿它当键会让每次正常刷新都判定成「换了账号」。
     const identity = await this.options.session.identity()
-    try {
-      const view = await fetchUsage(identity)
-      return view === undefined ? { loggedIn: false } : { loggedIn: true, view }
-    } catch (error) {
-      // 401/403：token 已失效，触发一次刷新后重试；刷新失败则回落「未登录」
-      if (error instanceof UsageAuthExpiredError) {
+    const key = usageCacheKey(identity)
+    const snapshot = await this.usageCache.read(key, async () => {
+      try {
+        return await fetchUsage(identity)
+      } catch (error) {
+        if (!(error instanceof UsageAuthExpiredError)) throw error
+        // 401/403：token 已失效，刷新后再试一次。刷新失败按「本次不可读」处理
+        // （undefined），而不是把错误抛给客户端——额度读不到不该让整卡片报错。
         try {
-          const refreshed = await this.options.session.identity()
-          const view = await fetchUsage(refreshed)
-          return view === undefined ? { loggedIn: false } : { loggedIn: true, view }
+          return await fetchUsage(await this.options.session.identity())
         } catch {
-          return { loggedIn: false }
+          return undefined
         }
       }
-      throw error
+    })
+    if (snapshot.view === undefined) return { loggedIn: false }
+    return {
+      loggedIn: true,
+      view: snapshot.view,
+      // 抓取时刻取缓存的原始时间，而不是「本次返回」的时间：陈旧缓存被后台
+      // 刷新时，这个值必须如实反映数据有多旧。
+      ...(snapshot.at === undefined ? {} : { fetchedAt: snapshot.at }),
     }
   }
 
@@ -111,6 +133,9 @@ export class CodeBuddyRemoteService extends TypertRemoteService {
     const credentials = this.ctx.get('credentials')
     if (credentials !== undefined) await credentials.deleteRecord(recordKey())
     this.options.session.invalidate()
+    // 额度读数属于刚离开的那个账号：立刻丢弃，否则重新登录后、下一次真实抓取
+    // 落地之前，缓存里的旧账号额度会被当成新账号的显示出来。
+    this.usageCache.clear()
     // 选择器里的模型列表属于刚离开的那个账号；播报让客户端丢掉它，
     // 而不是继续给一个已登出的用户看他的模型。
     this.options.session.announceCatalogChange()
@@ -127,7 +152,7 @@ export class CodeBuddyRemoteService extends TypertRemoteService {
   }
 
   @Remote
-  async setSettings(patch: { showUsage?: boolean; webSearch?: boolean }): Promise<void> {
+  async setSettings(patch: { showUsage?: boolean; showComposerUsage?: boolean; webSearch?: boolean }): Promise<void> {
     await updateSettings(this.ctx, patch)
   }
 }

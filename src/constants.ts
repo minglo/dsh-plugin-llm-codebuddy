@@ -50,6 +50,28 @@ export const DEFAULT_MAX_TOKENS = 8_192
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
 export const REFRESH_SKEW_MS = 60_000
 export const CATALOG_TTL_MS = 5 * 60 * 1000
+/**
+ * 宿主侧用量读数的缓存时长。
+ *
+ * 为什么需要它：额度接口是**多页**外呼（每页最长 10 秒），而每个客户端入口
+ * 各自订阅、各自可能重读（设置页挂载、面板打开、HMR 后重挂、刷新页面）。没有
+ * 缓存时，这些读取会各自打一轮完整的多页外呼——用户看到的是「指标要等一下才
+ * 出来」，网关看到的是同一账号同一份额度被反复查询。
+ *
+ * **取值与客户端轮询周期无关。** 客户端每 10 秒来问一次（USAGE_REFRESH_MS），
+ * 但真正决定打不打 CodeBuddy 的是这里的 TTL：条目仍新鲜就直接给缓存，陈旧时
+ * 也是先给旧值、只在没有在飞刷新时补一次共享刷新。所以轮询问得再勤，也只是
+ * 让界面更快看到后台已经刷新出来的新值——出站频率由 TTL 说话。
+ *
+ * 保持 60 秒不变。一个 TTL 窗口内容纳约 6 次轮询：缓存刚陈旧的那一次触发
+ * 刷新，其余命中新写入的条目——模拟（多页外呼按 1–8 秒计，3000 次 × 10 小时）
+ * 约 86% 的轮询被缓存吸收，约 14% 真的打到 CodeBuddy。
+ *
+ * 轮询加快后抓取频率会比以前略高：旧配置的 60 秒轮询恰好总踩在 TTL 边界附近，
+ * 平均间隔约 120 秒；现在更贴近 TTL 本身，约 70 秒（10 小时内 301 → 515 次）。
+ * 这是「问得更勤」的自然结果，不是缓存失效；要压低就把这里调大。
+ */
+export const USAGE_CACHE_TTL_MS = 60_000
 export const LOGIN_TIMEOUT_MS = 10 * 60 * 1000
 export const LOGIN_POLL_INTERVAL_MS = 1_000
 export const AUTH_PENDING_CODE = 11217

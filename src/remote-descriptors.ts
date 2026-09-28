@@ -94,6 +94,10 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
       result: z.object({
         loggedIn: z.boolean(),
         view: usageViewSchema.optional(),
+        // 抓取时刻由宿主给（宿主缓存让一次抓取服务多个入口与多次重挂）。
+        // optional：旧宿主不发它，客户端回落到本地时刻——写成必填会让
+        // 「新 client + 旧 host」在 decode 阶段丢掉整份读数。
+        fetchedAt: z.number().optional(),
       }),
     }),
     direct('startLogin', {
@@ -113,16 +117,25 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
       result: z.object({}),
     }),
     direct('getSettings', {
-      result: z.object({ showUsage: z.boolean(), webSearch: z.boolean() }),
+      result: z.object({
+        showUsage: z.boolean(),
+        // 与 status.searchBackend 同一条不变式：**必须 optional**。host 与 client 是
+        // 两个独立产物，浏览器 bundle 经 HMR 先换、宿主模块要重启才换；把新字段写成
+        // 必填，会让「新 client + 旧 host」的组合在 decode 阶段整张卡片静默消失。
+        // 客户端按 undefined 处理为该功能的默认值（显示）。
+        showComposerUsage: z.boolean().optional(),
+        webSearch: z.boolean(),
+      }),
     }),
     direct('setSettings', {
       parameters: [{
         name: 'patch',
         wire: 'patch',
         source: 'json',
-        // 局部更新：两个字段都可选（客户端只送被切换的那一个）。
+        // 局部更新：三个字段都可选（客户端只送被切换的那一个）。
         codec: strict('setSettings', 'patch', z.object({
           showUsage: z.boolean().optional(),
+          showComposerUsage: z.boolean().optional(),
           webSearch: z.boolean().optional(),
         })),
       }],

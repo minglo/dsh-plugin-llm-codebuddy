@@ -1,5 +1,8 @@
 import { CODEBUDDY_IDE_USER_AGENT, CODEBUDDY_USAGE_ENDPOINT, codeBuddyIdentityHeaders } from './constants.js'
 import type { CodeBuddyIdentity } from './codebuddy.js'
+// 到期日的 +08 日历换算与 client 共用同一份实现（见 expiry-days.ts 的说明）：
+// host 用它分累计窗口桶，client 用同一套规则分未来 7 个自然日段。
+import { daysFromToday, endTimeOf, shanghaiDayKey } from './expiry-days.js'
 
 /** usage 端点 401/403：token 失效，需触发刷新。与「拉取失败」区分。 */
 export class UsageAuthExpiredError extends Error {
@@ -90,30 +93,6 @@ function pointer(value: unknown, path: readonly string[]): unknown {
  * 解析失败返回 undefined（区别于「有确定到期时刻」），调用方据此既不判过期也不入档，
  * 但仍计入总额度 —— 避免脏数据被静默丢弃。
  */
-function endTimeOf(cycleEndTime: string): Date | undefined {
-  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(cycleEndTime)
-  if (m === null) return undefined
-  const [, y, mo, d, h, mi, s] = m
-  // Asia/Shanghai 固定 UTC+8、无夏令时：墙上时间 −8h 即得该时刻的 UTC 瞬间，与宿主时区无关。
-  return new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h) - 8, Number(mi), Number(s)))
-}
-
-/** d 在 Asia/Shanghai 日历中的 'YYYY-MM-DD' 键：UTC 时刻 +8h 后取日期段。 */
-function shanghaiDayKey(d: Date): string {
-  const wall = new Date(d.getTime() + 8 * 3_600_000)
-  return wall.toISOString().slice(0, 10)
-}
-
-/** 到期日距今天的日历日差；end 为 undefined（格式不符）时返回 undefined，不入任何档。 */
-function daysFromToday(end: Date | undefined, now: Date): number | undefined {
-  if (end === undefined) return undefined
-  const endKey = shanghaiDayKey(end)
-  const todayKey = shanghaiDayKey(now)
-  // 两键均为 'YYYY-MM-DD'：日历日差按 UTC 零点差折算，与宿主时区无关。
-  const diffMs = Date.parse(`${endKey}T00:00:00Z`) - Date.parse(`${todayKey}T00:00:00Z`)
-  return Math.round(diffMs / 86_400_000)
-}
-
 /** Asia/Shanghai 当前墙上时间 'YYYY-MM-DD HH:mm:ss'（API 期望的 naive +08 时间）。 */
 function shanghaiWallNow(): string {
   const now = new Date()

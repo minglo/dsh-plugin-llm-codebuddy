@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GenerateOptions, LlmModelInfo } from '@deepseek-ai/dsh-llm'
-import { CodeBuddyAdapter, httpErrorCode } from '../src/adapter.js'
+import { CodeBuddyAdapter, failureCode, httpErrorCode } from '../src/adapter.js'
 import type { CodeBuddyConnectionOptions } from '../src/adapter.js'
 import type { CodeBuddySession } from '../src/session.js'
 import { NotLoggedInError } from '../src/session.js'
@@ -57,12 +57,16 @@ function streamResponse(lines: string[]): Response {
   } as unknown as Response
 }
 
-function errorResponse(status: number, body: unknown): Response {
+function errorResponse(status: number, body: unknown, headers: Headers = new Headers()): Response {
+  // 适配器先整段读文本、再自己 JSON.parse（body 里的重置时刻就在那段文本里），
+  // 所以假回复必须像真回复一样给出 text()。
+  const text = typeof body === 'string' ? body : JSON.stringify(body)
   return {
     ok: status >= 200 && status < 300,
     status,
-    headers: new Headers(),
-    json: async () => body,
+    headers,
+    text: async () => text,
+    json: async () => (typeof body === 'string' ? JSON.parse(body) as unknown : body),
   } as unknown as Response
 }
 
@@ -100,6 +104,7 @@ function collect(iterable: AsyncIterable<unknown>): Promise<unknown[]> {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 describe('httpErrorCode', () => {
@@ -380,6 +385,74 @@ describe('stream', () => {
     })
   })
 
+  it('turns a 429 that names its reset instant into a scheduled retry, not an immediate one', async () => {
+    // 逐字照抄 2026-09-27 那次失败的文案（会话日志 seq 45）：措辞是中文，英文分类器
+    // 认不出来，于是它落成「可重试」的 RATE_LIMIT 并被立刻重试 5 次。
+    // 这里要的是：把报文里的重置时刻读出来交给宿主调度，别再即时重试。
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-27T08:00:00Z'))
+    installFetch(() => errorResponse(429, {
+      code: 11115,
+      msg: 'usage limit exceeded',
+      displayMsg: { zh: '您的使用量已超出频率限制，将在 2026-09-27 17:30:18 UTC+8 重置，您也可以切换其他模型继续使用。' },
+    }, new Headers({ 'x-request-id': 'c21faf12-cfb8-4d2a-89ef-700d525b4b23' })))
+    await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
+      name: 'LlmError',
+      code: 'RATE_LIMIT',
+      message: '您的使用量已超出频率限制，将在 2026-09-27 17:30:18 UTC+8 重置，您也可以切换其他模型继续使用。',
+      failure: {
+        code: 'RATE_LIMIT',
+        status: 429,
+        // 17:30:18 +08 - 16:00:00 +08 = 5,418,000ms，再加 1 秒边界余量。
+        providerRetryAfterMs: 5_419_000,
+        requestId: 'c21faf12-cfb8-4d2a-89ef-700d525b4b23',
+      },
+    })
+  })
+
+  it('reads the reset instant out of a body it cannot parse as JSON', async () => {
+    // 服务偶尔回一段非 JSON 的错误页；只要文本里有那个时刻，调度就不该丢。
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-27T08:00:00Z'))
+    installFetch(() => errorResponse(429, 'rate limited; resets at 2026-09-27 17:30:18 UTC+8'))
+    await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
+      code: 'RATE_LIMIT',
+      failure: { providerRetryAfterMs: 5_419_000 },
+    })
+  })
+
+  it('prefers an explicit Retry-After over a sentence read out of the body', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-27T08:00:00Z'))
+    installFetch(() => errorResponse(429, {
+      displayMsg: { zh: '您的使用量已超出频率限制，将在 2026-09-27 17:30:18 UTC+8 重置。' },
+    }, new Headers({ 'retry-after': '30' })))
+    await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
+      failure: { providerRetryAfterMs: 30_000 },
+    })
+  })
+
+  it('keeps a 429 without a readable retry time unattached and logs the body', async () => {
+    // 服务说稍后再试却没说什么时候：不能凭空造一个等待，但要留下原文供核对。
+    const warn = vi.fn()
+    installFetch(() => errorResponse(429, { code: 11115, msg: 'too many requests' }))
+    const failing = new CodeBuddyAdapter({ session: fakeSession(), options: () => connection, warn })
+    const error = await collect(failing.stream(genOptions())).then(
+      () => undefined,
+      (thrown: unknown) => thrown as { failure: Record<string, unknown> },
+    )
+    expect(error?.failure).toMatchObject({ code: 'RATE_LIMIT', status: 429 })
+    expect(Object.hasOwn(error!.failure, 'providerRetryAfterMs')).toBe(false)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0]?.[0]).toContain('too many requests')
+  })
+
+  it('keeps QUOTA for a 429 that names no reset instant', async () => {
+    // 没有「何时可再试」的额度措辞仍是终态额度问题，不该被当成限流来重试。
+    expect(failureCode(429, 'insufficient quota for this account', undefined)).toBe('QUOTA')
+    expect(failureCode(429, undefined, 1_000)).toBe('RATE_LIMIT')
+  })
+
   it('reports the curated sentence in the requested language', async () => {
     installFetch(() => errorResponse(400, {
       code: 11101,
@@ -415,7 +488,7 @@ describe('stream', () => {
       ok: false,
       status: 503,
       headers: new Headers(),
-      json: async () => { throw new Error('truncated') },
+      text: async () => { throw new Error('truncated') },
     } as unknown as Response))
     await expect(collect(adapter(fakeSession()).stream(genOptions()))).rejects.toMatchObject({
       name: 'LlmError',

@@ -44,7 +44,7 @@ const samples: Record<string, unknown> = {
   startLogin: { authUrl: 'https://cb/login', state: 'st-1' },
   pollLogin: { done: true },
   logout: {},
-  getSettings: { showUsage: true, webSearch: false },
+  getSettings: { showUsage: true, showComposerUsage: false, webSearch: false },
   setSettings: {},
 }
 
@@ -153,6 +153,18 @@ describe('TYPERT_REMOTE (client remote descriptors)', () => {
       expect(descriptor.parameters).toHaveLength(0)
     })
 
+    it('getSettings tolerates a host that predates showComposerUsage', () => {
+      // host 与 client 是两个独立产物：浏览器 bundle 经 HMR 可以先换，宿主模块
+      // 要重启才换。新 client + 旧 host 时 decode 必须成功，否则整张配置卡片
+      // 会静默消失（与 status.searchBackend 是同一条不变式）。
+      const descriptor = TYPERT_REMOTE.descriptors.find(d => d.method === 'getSettings')
+      expect(descriptor).toBeDefined()
+      if (!descriptor) return
+      const schema = schemaOf(asStrict(descriptor.result))
+      expect(schema.parse({ showUsage: true, webSearch: false }))
+        .toEqual({ showUsage: true, webSearch: false })
+    })
+
     it('startLogin/getSettings/pollLogin match their host payloads', () => {
       const start = TYPERT_REMOTE.descriptors.find(d => d.method === 'startLogin')
       expect(start).toBeDefined()
@@ -162,12 +174,12 @@ describe('TYPERT_REMOTE (client remote descriptors)', () => {
       if (poll) expect(schemaOf(asStrict(poll.result)).parse({ done: false })).toEqual({ done: false })
       const settings = TYPERT_REMOTE.descriptors.find(d => d.method === 'getSettings')
       expect(settings).toBeDefined()
-      if (settings) expect(schemaOf(asStrict(settings.result)).parse({ showUsage: true, webSearch: false })).toEqual({ showUsage: true, webSearch: false })
+      if (settings) expect(schemaOf(asStrict(settings.result)).parse({ showUsage: true, showComposerUsage: false, webSearch: false })).toEqual({ showUsage: true, showComposerUsage: false, webSearch: false })
     })
   })
 
   describe('setSettings', () => {
-    it('has exactly one patch parameter with a strict partial { showUsage?, webSearch? } codec', () => {
+    it('has exactly one patch parameter with a strict partial { showUsage?, showComposerUsage?, webSearch? } codec', () => {
       const descriptor = TYPERT_REMOTE.descriptors.find(d => d.method === 'setSettings')
       expect(descriptor).toBeDefined()
       if (!descriptor) return
@@ -181,11 +193,14 @@ describe('TYPERT_REMOTE (client remote descriptors)', () => {
       expect(codec.typeSymbol).toContain('setSettings')
       const schema = schemaOf(codec)
       expect(schema.parse({ showUsage: true })).toEqual({ showUsage: true })
+      expect(schema.parse({ showComposerUsage: true })).toEqual({ showComposerUsage: true })
       expect(schema.parse({ webSearch: true })).toEqual({ webSearch: true })
-      expect(schema.parse({ showUsage: false, webSearch: true })).toEqual({ showUsage: false, webSearch: true })
+      expect(schema.parse({ showUsage: false, showComposerUsage: false, webSearch: true }))
+        .toEqual({ showUsage: false, showComposerUsage: false, webSearch: true })
       // 两个字段都可选：局部更新只送被切换的那一个。空 patch 是合法的无操作。
       expect(schema.parse({})).toEqual({})
       expect(() => schema.parse({ showUsage: 'yes' })).toThrow()
+      expect(() => schema.parse({ showComposerUsage: 'yes' })).toThrow()
       expect(() => schema.parse({ webSearch: 'yes' })).toThrow()
     })
 

@@ -8,7 +8,7 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
 }))
 
 import { UsageIndicator } from '../src/client/UsageIndicator.jsx'
-import { MORANDI, SEGMENT_COLORS, monthColor, tint } from '../src/client/palette.js'
+import { MORANDI, SEGMENT_COLORS, EXPIRY_COLORS, monthColor, tint } from '../src/client/palette.js'
 
 // ── 色彩度量：sRGB → HSL（判莫兰迪）与 CIE Lab（判可分辨性） ──────────────
 
@@ -131,6 +131,63 @@ describe('莫兰迪调色板', () => {
     expect(monthColor(0.7)).toBe(MORANDI.month)
     expect(monthColor(0.9)).toBe(MORANDI.monthHigh)
     expect(new Set([monthColor(0.1), monthColor(0.7), monthColor(0.9)]).size).toBe(3)
+  })
+
+  it('7 天圆环色阶：7 步互不相同，且相邻两天足够可分辨', () => {
+    expect(EXPIRY_COLORS).toHaveLength(7)
+    expect(new Set(EXPIRY_COLORS).size).toBe(7)
+    // 这条是本次修改的**核心**：上一版把 7 天做成「相邻 ΔE≈4」的连续渐变，
+    // 肉眼读到的是一片糊，用户的原话是「看不明白」。
+    // 阈值 11 与下面 BAR_COLORS 用的同一把尺子（palette.test.ts 既有标准）。
+    for (let i = 1; i < EXPIRY_COLORS.length; i++) {
+      const d = deltaE(EXPIRY_COLORS[i - 1] as string, EXPIRY_COLORS[i] as string)
+      expect(d, `第 ${i - 1} 天 vs 第 ${i} 天只差 ${d.toFixed(1)}`).toBeGreaterThanOrEqual(11)
+    }
+  })
+
+  it('7 天色阶与侧栏三段条是两套色，且圆环内部全对可分辨', () => {
+    // 刻意**不**复用 SEGMENT_COLORS：那三个锚点彼此只差 ΔE≈11.8，摊到 3 步
+    // 每步 ≈3.9，永远到不了可分辨阈值。这条断言防止有人「顺手统一」两套色，
+    // 那会把 7 天重新糊成一片。
+    for (const anchor of SEGMENT_COLORS) {
+      expect(EXPIRY_COLORS as readonly string[]).not.toContain(anchor)
+    }
+    let min = Number.POSITIVE_INFINITY
+    let worst = ''
+    for (let i = 0; i < EXPIRY_COLORS.length; i++) {
+      for (let j = i + 1; j < EXPIRY_COLORS.length; j++) {
+        const d = deltaE(EXPIRY_COLORS[i] as string, EXPIRY_COLORS[j] as string)
+        if (d < min) { min = d; worst = `第 ${i} 天 vs 第 ${j} 天` }
+      }
+    }
+    expect(min, `最接近的一对是 ${worst}，只差 ${min.toFixed(1)}`).toBeGreaterThanOrEqual(11)
+  })
+
+  it('7 天色阶保留时间轴：色相单调推进（越近越暖）', () => {
+    const hues = EXPIRY_COLORS.map(hex => hsl(hex))
+    for (let i = 1; i < hues.length; i++) {
+      expect(hues[i]!.h, `第 ${i} 步色相应大于上一步`).toBeGreaterThan(hues[i - 1]!.h)
+    }
+  })
+
+  it('7 天色阶与其它环的数据色也能分开（同屏共现）', () => {
+    // 已用环 / 本月三档与 7 天分段同屏出现，彼此不能撞色。
+    const others = [MORANDI.used, MORANDI.monthLow, MORANDI.month, MORANDI.monthHigh]
+    for (const other of others) {
+      for (const day of EXPIRY_COLORS) {
+        const d = deltaE(other, day)
+        expect(d, `${other} vs ${day} 只差 ${d.toFixed(1)}`).toBeGreaterThanOrEqual(11)
+      }
+    }
+  })
+
+  it('7 天色阶的每一档仍是莫兰迪（中明度、低饱和）', () => {
+    for (const hex of EXPIRY_COLORS) {
+      const { s, l } = hsl(hex)
+      expect(s, `${hex} 饱和度过高`).toBeLessThanOrEqual(0.32)
+      expect(l, `${hex} 明度出界`).toBeGreaterThanOrEqual(0.45)
+      expect(l, `${hex} 明度出界`).toBeLessThanOrEqual(0.80)
+    }
   })
 
   it('状态徽标色离各数据色仍可分辨（阈值放宽到 9：徽标小且有文字兜底）', () => {

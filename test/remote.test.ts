@@ -226,7 +226,9 @@ describe('CodeBuddyRemoteService', () => {
       const fetchSpy = vi.spyOn(usage, 'fetchUsage').mockResolvedValue(view)
       const svc = new CodeBuddyRemoteService(ctx, { session })
 
-      await expect(svc.usage()).resolves.toEqual({ loggedIn: true, view })
+      // fetchedAt 由宿主给出（额度缓存让一次抓取服务多个入口与多次重挂），
+      // 所以断言到字段而不是整对象相等。
+      await expect(svc.usage()).resolves.toEqual({ loggedIn: true, view, fetchedAt: expect.any(Number) })
 
       expect(identity).toHaveBeenCalledTimes(1)
       expect(fetchSpy).toHaveBeenCalledTimes(1)
@@ -244,7 +246,7 @@ describe('CodeBuddyRemoteService', () => {
         .mockResolvedValueOnce(view)
       const svc = new CodeBuddyRemoteService(ctx, { session })
 
-      await expect(svc.usage()).resolves.toEqual({ loggedIn: true, view })
+      await expect(svc.usage()).resolves.toEqual({ loggedIn: true, view, fetchedAt: expect.any(Number) })
 
       expect(identity).toHaveBeenCalledTimes(2)
       expect(fetchSpy).toHaveBeenCalledTimes(2)
@@ -350,7 +352,7 @@ describe('CodeBuddyRemoteService', () => {
       const ctx = new Context()
       const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session })
 
-      await expect(svc.getSettings()).resolves.toEqual({ showUsage: true, webSearch: false })
+      await expect(svc.getSettings()).resolves.toEqual({ showUsage: false, showComposerUsage: true, webSearch: false })
     })
 
     it('returns the authoritative values from the settings handle', async () => {
@@ -358,23 +360,23 @@ describe('CodeBuddyRemoteService', () => {
       const ctx = new Context()
       const svc = new CodeBuddyRemoteService(ctx, {
         session: sessionStub().session,
-        settings: () => ({ showUsage: false, webSearch: true }),
+        settings: () => ({ showUsage: false, showComposerUsage: false, webSearch: true }),
       })
 
-      await expect(svc.getSettings()).resolves.toEqual({ showUsage: false, webSearch: true })
+      await expect(svc.getSettings()).resolves.toEqual({ showUsage: false, showComposerUsage: false, webSearch: true })
     })
 
     it('re-reads the handle on every call (volatile commits are visible immediately)', async () => {
       const ctx = new Context()
-      let current = { showUsage: true, webSearch: false }
+      let current = { showUsage: true, showComposerUsage: false, webSearch: false }
       const svc = new CodeBuddyRemoteService(ctx, {
         session: sessionStub().session,
         settings: () => current,
       })
 
-      await expect(svc.getSettings()).resolves.toEqual({ showUsage: true, webSearch: false })
-      current = { showUsage: true, webSearch: true }
-      await expect(svc.getSettings()).resolves.toEqual({ showUsage: true, webSearch: true })
+      await expect(svc.getSettings()).resolves.toEqual({ showUsage: true, showComposerUsage: false, webSearch: false })
+      current = { showUsage: true, showComposerUsage: true, webSearch: true }
+      await expect(svc.getSettings()).resolves.toEqual({ showUsage: true, showComposerUsage: true, webSearch: true })
     })
   })
 
@@ -399,6 +401,17 @@ describe('CodeBuddyRemoteService', () => {
       await expect(svc.setSettings({ showUsage: true })).resolves.toBeUndefined()
 
       expect(settings.calls).toEqual([{ ns: 'plugin-llm-codebuddy', ops: [{ op: 'set', path: ['showUsage'], value: true }] }])
+    })
+
+    it('writes a showComposerUsage-only patch without touching the other switches', async () => {
+      const ctx = new Context()
+      await ctx.plugin(FakeSettings)
+      const settings = ctx.get('settings') as FakeSettings
+      const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session })
+
+      await expect(svc.setSettings({ showComposerUsage: false })).resolves.toBeUndefined()
+
+      expect(settings.calls).toEqual([{ ns: 'plugin-llm-codebuddy', ops: [{ op: 'set', path: ['showComposerUsage'], value: false }] }])
     })
 
     it('writes a webSearch-only patch without touching showUsage', async () => {

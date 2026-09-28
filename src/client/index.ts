@@ -8,6 +8,8 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-api-gateway/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+// Type-only: pulls ui-conversation 的 SlotMap 合并（conversation.input.right 等键）。
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import { TYPERT_REMOTE } from '../remote-descriptors.js'
 import { PACKAGE_NAME } from '../constants.js'
@@ -15,6 +17,8 @@ import type { LoginPoll, LoginStart, SettingsView, StatusView, UsageResult } fro
 import { en, zh, type LocaleKey } from './locales.js'
 import { CodeBuddyTab, type CodeBuddyTabInjected } from './CodeBuddyTab.jsx'
 import { UsageIndicator, type UsageIndicatorInjected } from './UsageIndicator.jsx'
+import { ComposerUsage, type ComposerUsageInjected } from './ComposerUsage.jsx'
+import { ensurePluginCss } from './CodeBuddyTab.jsx'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -36,7 +40,7 @@ interface CodeBuddyRemote {
   pollLogin(state: string): Promise<RemoteResult<LoginPoll>>
   logout(): Promise<RemoteResult<void>>
   getSettings(): Promise<RemoteResult<SettingsView>>
-  setSettings(patch: { showUsage?: boolean; webSearch?: boolean }): Promise<RemoteResult<void>>
+  setSettings(patch: { showUsage?: boolean; showComposerUsage?: boolean; webSearch?: boolean }): Promise<RemoteResult<void>>
 }
 
 export const NS = 'settings.codebuddy'
@@ -55,6 +59,9 @@ const BUNDLE_KEY = PACKAGE_NAME
 export const inject = ['slots', 'locale', 'remote', 'configForms'] as const
 
 export function apply(ctx: ClientContext): void {
+  // 样式在插件加载时就注入，而不是等某个组件挂载后的 effect——否则胶囊首次
+  // 渲染会有一帧没有 .cb-pill（悬停底色/圆角/内距都还没生效）。注入是幂等的。
+  ensurePluginCss()
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'codebuddy: dictionaries')
   const t = ctx.locale.bind(NS)
 
@@ -74,6 +81,10 @@ export function apply(ctx: ClientContext): void {
         remote: codebuddyRemote,
         setShowUsage: async (showUsage) => {
           const result = await codebuddyRemote.setSettings({ showUsage })
+          if (!result.ok) throw new Error(result.error.message)
+        },
+        setShowComposerUsage: async (showComposerUsage) => {
+          const result = await codebuddyRemote.setSettings({ showComposerUsage })
           if (!result.ok) throw new Error(result.error.message)
         },
         setWebSearch: async (webSearch) => {
@@ -112,6 +123,25 @@ export function apply(ctx: ClientContext): void {
         locale: NS,
         inject: indicatorInject,
       }, UsageIndicator)))
+
+      // 输入框工具行（模型选择器左侧）的额度胶囊。`conversation.input.right` 是
+      // kind: list、replaceRisk: none 的标准槽：新 id 与既有 occupant（opencode-go
+      // 之类的用量胶囊）并存，不遮蔽任何官方控件。owner 在 composer 的
+      // standardControls 里先渲染本槽、再渲染 `conversation.input.model`。
+      // 无需 `conversation.input.right` 出现在顶层 inject：注册经 slots.inject
+      // 等待宿主声明，与 activation 顺序无关（同 sidebar.footer.action）。
+      const composerInject = (): ComposerUsageInjected => ({
+        remote: codebuddyRemote,
+        t: t as (k: string) => string,
+      })
+
+      disposers.push(ctx.slots.inject('conversation.input.right', () => ctx.slots.register({
+        name: 'conversation.input.right',
+        id: 'llm-codebuddy-usage',
+        order: 20,
+        locale: NS,
+        inject: composerInject,
+      }, ComposerUsage)))
     } catch (error) {
       // mount 或槽位注册失败：先释放已注册资源，再抛出让 fiber 进入 FAILED。
       for (const dispose of disposers.reverse()) dispose()

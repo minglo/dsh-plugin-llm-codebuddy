@@ -25,21 +25,30 @@ class FakeSettings extends Service {
 }
 
 describe('SettingsSchema (volatile fields)', () => {
-  it('declares showUsage true and webSearch false as volatile fields', () => {
+  it('declares every switch as a volatile field with its default', () => {
     // toJSON 的 refs 表里每个字段的 meta.volatile / meta.default（schemastery 3.18.4）。
     const json = SettingsSchema.toJSON() as { refs: Record<string, { type: string; meta?: { volatile?: boolean; default?: unknown } }> }
     const fields = Object.values(json.refs).filter(node => node.type === 'boolean')
-    const showUsage = fields.find(node => node.meta?.default === true)
-    const webSearch = fields.find(node => node.meta?.default === false)
-    expect(showUsage?.meta?.volatile).toBe(true)
-    expect(webSearch?.meta?.volatile).toBe(true)
+    // 三个开关都必须 volatile：切换要走 loader 的就地提交，不能重挂插件。
+    // 默认值：showUsage 关、showComposerUsage 开、webSearch 关。
+    const defaults = fields.map(node => node.meta?.default).sort()
+    expect(defaults).toEqual([false, false, true])
+    for (const node of fields) expect(node.meta?.volatile).toBe(true)
+  })
+
+  it('gives the two entries opposite defaults: composer pill on, sidebar off', () => {
+    // 两处入口分成两个字段：只开其中一个的用户不该被迫接受另一个。
+    // 输入框胶囊默认**开**（只在选中 CodeBuddy 模型时出现的上下文入口，不占常驻
+    // 界面），侧栏指示器默认**关**（侧栏底部是常驻状态区，加进度条改变默认界面）。
+    expect(SettingsSchema({}).showComposerUsage.get()).toBe(true)
+    expect(SettingsSchema({}).showUsage.get()).toBe(false)
   })
 
   it('resolves missing config to volatile refs carrying the schema defaults', () => {
     // resolveConfig 后每个字段是 Volatile 引用；展开后即官方入口默认。
     expect(DEFAULT_SETTINGS.webSearch).toBe(false)
     const resolved = readSettings(SettingsSchema({}))
-    expect(resolved).toEqual({ showUsage: true, webSearch: false })
+    expect(resolved).toEqual({ showUsage: false, showComposerUsage: true, webSearch: false })
   })
 })
 
@@ -52,21 +61,25 @@ describe('SETTINGS_NS', () => {
 
 describe('readSettings', () => {
   it('reads plain config values with schema-default fallbacks', () => {
-    expect(readSettings({ showUsage: false, webSearch: true })).toEqual({ showUsage: false, webSearch: true })
-    expect(readSettings({})).toEqual({ showUsage: true, webSearch: false })
-    expect(readSettings(undefined)).toEqual({ showUsage: true, webSearch: false })
+    expect(readSettings({ showUsage: false, showComposerUsage: false, webSearch: true }))
+      .toEqual({ showUsage: false, showComposerUsage: false, webSearch: true })
+    expect(readSettings({})).toEqual({ showUsage: false, showComposerUsage: true, webSearch: false })
+    expect(readSettings(undefined)).toEqual({ showUsage: false, showComposerUsage: true, webSearch: false })
   })
 
   it('unwraps volatile references (cosmokit Volatile 的 .get() 快照)', () => {
     const config = {
       showUsage: { get: () => false },
+      showComposerUsage: { get: () => false },
       webSearch: { get: () => true },
     }
-    expect(readSettings(config)).toEqual({ showUsage: false, webSearch: true })
+    expect(readSettings(config)).toEqual({ showUsage: false, showComposerUsage: false, webSearch: true })
   })
 
   it('ignores non-boolean garbage instead of propagating it', () => {
-    expect(readSettings({ showUsage: 'yes', webSearch: null })).toEqual({ showUsage: true, webSearch: false })
+    // 非布尔垃圾值一律回落到 schema 默认，而不是把垃圾透传出去。
+    expect(readSettings({ showUsage: 'yes', showComposerUsage: 1, webSearch: null }))
+      .toEqual({ showUsage: false, showComposerUsage: true, webSearch: false })
   })
 })
 
