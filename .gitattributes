@@ -1,0 +1,14 @@
+# Force LF on every text file.
+#
+# Checks are run on Linux and the plugin source, locale JSON and workflow YAML
+# are all reviewed as diffs; a Windows contributor whose editor writes CRLF
+# would otherwise show every line of every file as changed, and the packed
+# tarball would ship CRLF into a Linux-only runtime.
+* text=auto eol=lf
+
+# Explicitly binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.tgz binary

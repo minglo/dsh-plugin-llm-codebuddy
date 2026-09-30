@@ -267,7 +267,7 @@ describe('stream', () => {
     expect(calls[0]?.url).toBe('https://copilot.tencent.com/v2/chat/completions')
     const headers = calls[0]?.init.headers ?? {}
     const userAgent = headers['user-agent'] ?? headers['User-Agent'] ?? ''
-    expect(userAgent).toMatch(/^dsh-codebuddy\/\d+\.\d+\.\d+ \(\+https:\/\/github\.com\/minglo\/dsh-plugin-codebuddy\)$/)
+    expect(userAgent).toMatch(/^dsh-codebuddy\/\d+\.\d+\.\d+ \(\+https:\/\/github\.com\/minglo\/dsh-plugin-llm-codebuddy\)$/)
     expect(userAgent.toLowerCase()).not.toContain('deepseek-harness')
     expect(headers['Authorization']).toBe('Bearer t')
     expect(headers['X-Domain']).toBe('d')

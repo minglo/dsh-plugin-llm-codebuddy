@@ -1,9 +1,11 @@
+# CI：类型、测试、构建与打包产物三道关，任何一道红都不该合入。
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,16 +13,64 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 = engines 的下界（本地开发用的就是它）；24 = 发布路径用的那条线
+        # （OIDC trusted publishing 要求 npm >= 11.5.1，node 22 自带的 npm 10.x
+        # 不行）。两条都测，发布用的 node 版本就不会等到发版那天才第一次跑。
+        node: [22, 24]
     steps:
       - uses: actions/checkout@v4
+
       - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: pnpm
+
       - run: pnpm install --frozen-lockfile
       - run: pnpm run typecheck
       - run: pnpm test
       - run: pnpm run build
+
+      # 打包产物冒烟：`files` 漏掉一个运行时相对导入时，构建与单测都还是绿的，
+      # 只有装上 tarball 才炸。这里按清单核对，并禁止源码混进产物。
       - name: Pack artifact smoke
-        run: pnpm pack --pack-destination "${RUNNER_TEMP}/pkg"
+        run: |
+          mkdir -p "$RUNNER_TEMP/pkg"
+          pnpm pack --pack-destination "$RUNNER_TEMP/pkg"
+          TARBALL="$(ls "$RUNNER_TEMP/pkg"/*.tgz)"
+          echo "artifact: $TARBALL"
+          tar -tzf "$TARBALL" | sort > "$RUNNER_TEMP/listing.txt"
+
+          missing=0
+          for required in \
+            package/package.json \
+            package/cordis.patch.yml \
+            package/README.md \
+            package/LICENSE \
+            package/locale/en.json \
+            package/locale/zh.json \
+            package/dist/index.js \
+            package/dist/index.d.ts \
+            package/dist/client.js \
+            package/dist/remote-descriptors.js \
+            package/dist/remote-descriptors.d.ts
+          do
+            if ! grep -qx "$required" "$RUNNER_TEMP/listing.txt"; then
+              echo "::error::$required 不在产物里"
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ] || exit 1
+
+          # `.d.ts` 是产物的一部分（类型入口指着它），只有真正的源码是违规项。
+          if grep -E '(^|/)src/|\.tsx?$' "$RUNNER_TEMP/listing.txt" | grep -vE '\.d\.ts$' | grep -q .; then
+            echo "::error::产物里混进了 TypeScript 源码："
+            grep -E '(^|/)src/|\.tsx?$' "$RUNNER_TEMP/listing.txt" | grep -vE '\.d\.ts$'
+            exit 1
+          fi
+
+          echo "产物核对通过：$(wc -l < "$RUNNER_TEMP/listing.txt") 个条目"

@@ -1,6 +1,13 @@
 # dsh-plugin-llm-codebuddy
 
+[![CI](https://github.com/minglo/dsh-plugin-llm-codebuddy/actions/workflows/ci.yml/badge.svg)](https://github.com/minglo/dsh-plugin-llm-codebuddy/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/dsh-plugin-llm-codebuddy.svg)](https://www.npmjs.com/package/dsh-plugin-llm-codebuddy)
+[![license](https://img.shields.io/npm/l/dsh-plugin-llm-codebuddy.svg)](./LICENSE)
+
 腾讯 CodeBuddy 的 DeepSeek Harness（`dsh`）适配插件。
+
+> **认准包名**：本插件是 `dsh-plugin-llm-codebuddy`。npm 上另有他人维护的
+> `dsh-llm-codebuddy`，两者无关，安装时别拿错。
 
 它把 CodeBuddy 的模型目录与对话端点接入 harness，注册为名为 `codebuddy` 的
 LLM 路由，让你的 CodeBuddy 账号额度直接用于 `dsh` 里的对话。插件是**只读**的：
@@ -145,6 +152,66 @@ provider 时它既无意义也不该占位。
 
 - 命令行登录命令。
 - 目录与用户自定义模型条目的合并。
+
+## 开发
+
+```sh
+pnpm install
+pnpm run verify     # typecheck + test + build，打包前的门禁
+```
+
+改动落在 `src/`，`dist/` 由 `pnpm run build` 生成、不进版本库（`files` 会把它带进
+产物）。插件对外声明的命名面记在 [`dsh-plugin.naming.json`](./dsh-plugin.naming.json)：
+改 provider、设置命名空间或服务名时要同步更新它。
+
+## 发布
+
+日常发版只有一步：抬一版 `package.json` 的 `version`，推到 `main`。
+
+```sh
+npm version patch --no-git-tag-version
+git commit -am "chore: release 1.0.1"     # 版本号用上一步输出的那个
+git push
+```
+
+推上去之后自动完成剩下的事：
+
+| Workflow | 做什么 |
+| --- | --- |
+| [auto-tag.yml](.github/workflows/auto-tag.yml) | 按 `version` 打 tag `v<version>`，再呼叫 publish |
+| [publish.yml](.github/workflows/publish.yml) | 认证并发布到 npm，生成 provenance |
+
+两个都幂等：tag 已存在、或该版本已在 npm 上，都直接跳过，所以往 `main` 推普通提交
+不会重复发布。认证走 OIDC Trusted Publishing，仓库里没有也不该有 `NPM_TOKEN`。
+
+### 首次发布必须手工做一次
+
+包在 npm 上还不存在时，`publish.yml` 会以一条 notice 跳过而不是报错——npm 只允许把
+Trusted Publisher 挂在**已存在**的包上，给不存在的包做 OIDC 认证会直接回 404。
+所以首发要手工做：
+
+```sh
+npm login
+npm publish --access public     # 门禁由 prepublishOnly（typecheck + test + build）承担
+```
+
+发完到 npm 的包设置里加一个 Trusted Publisher：
+
+| 字段 | 值 |
+| --- | --- |
+| Repository | `minglo/dsh-plugin-llm-codebuddy` |
+| Workflow | `publish.yml` |
+| Environment | 留空 |
+
+此后的版本就都由 workflow 自动发布了。
+
+### 补发与回滚
+
+- tag 在但没发出去：`gh workflow run publish.yml --ref v<version>`。
+- `main` 被重写（squash 后强推）导致 tag 指向历史外的提交：`gh workflow run auto-tag.yml`
+  会重建 tag。
+- 发错了：优先撤回（删 tag，或把 tag 指回旧提交），不要靠再补一个「两边都能用」的
+  版本来糊。
 
 ## 许可证
 

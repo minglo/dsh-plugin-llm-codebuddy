@@ -1,7 +1,7 @@
 export const PACKAGE_NAME = 'dsh-plugin-llm-codebuddy'
 export const PLUGIN_NAME = 'plugin-llm-codebuddy'
 export const CODEBUDDY_PRODUCT = 'dsh-codebuddy'
-export const CODEBUDDY_REPO_URL = 'https://github.com/minglo/dsh-plugin-codebuddy'
+export const CODEBUDDY_REPO_URL = 'https://github.com/minglo/dsh-plugin-llm-codebuddy'
 export const CODEBUDDY_PROVIDER = 'codebuddy'
 export const CODEBUDDY_DISPLAY_NAME = 'CodeBuddy'
 export const CODEBUDDY_ENDPOINT = 'https://copilot.tencent.com'

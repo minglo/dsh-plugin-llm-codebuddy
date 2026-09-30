@@ -1,44 +1,66 @@
+# 由版本 tag 触发发布到 npm。
+#
+# 两个触发口，各自覆盖一种情形：
+#   - `push: tags v*`     —— 人手动推 tag
+#   - `workflow_dispatch` —— auto-tag.yml 显式呼叫
+# auto-tag.yml 用 GITHUB_TOKEN 推 tag，GitHub 会抑制随之而来的 push 事件（防循环），
+# 所以自动路径只能靠 dispatch 打通。
+#
+# 认证走 OIDC（id-token: write），不存 NPM_TOKEN：把本仓库的 workflow 在 npm 上记为
+# Trusted Publisher 即可。provenance 也随之免费生成。
 name: Publish to npm
 
 on:
   push:
     tags:
       - 'v*'
-  # auto-tag 由 GITHUB_TOKEN 推 tag，其 push 事件不会触发本 workflow（防循环机制），
-  # 故由 auto-tag 打完 tag 后通过 gh workflow run 显式呼叫
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write   # OIDC：npm 侧已信任 GitHub Actions，无 token 也能发布
+  id-token: write   # OIDC：npm 侧信任本 workflow，无需 token 即可发布
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v4
         with:
           # 必须 >= node 24：OIDC trusted publishing 要求 npm >= 11.5.1，
-          # 而 node 22 早期版本自带的 npm 10.x 会静默回退到 token 认证后失败。
+          # 而 node 22 自带的 npm 10.x 会在认证阶段静默回退后失败。
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
           cache: pnpm
+
       - run: pnpm install --frozen-lockfile
-      # 先判重：已发布的版本无需再跑一遍门禁。
-      - name: Skip if already published
+
+      # 两种情形应该以「提示 + 跳过」而不是红灯收场：
+      #   - 该版本已在 npm 上（重跑，或 tag 被推了两次）；
+      #   - 这个包在 npm 上**根本不存在**，即首次发布。npm 不接受给尚不存在的包做
+      #     OIDC 发布——trusted publisher 只能挂在已存在的包上，`npm publish` 会
+      #     直接回一个 404——所以首发必须手工做一次。见 README「发布」。
+      - name: Decide whether to publish
         run: |
           PKG="$(node -p "require('./package.json').name")"
           VER="$(node -p "require('./package.json').version")"
           if npm view "$PKG"@"$VER" version >/dev/null 2>&1; then
-            echo "version $VER already published, skip"
+            echo "$PKG@$VER 已在 npm 上，无需发布"
+          elif ! npm view "$PKG" version >/dev/null 2>&1; then
+            echo "::notice title=首次发布::'$PKG' 尚不在 npm 上，OIDC 无法创建它"
+            echo "（trusted publisher 只能挂到已存在的包上）。请先手工发布 ${VER} 一次，"
+            echo "再在 npm 上为本仓库配置 Trusted Publishing —— 见 README「发布」。"
             echo "skip=true" >> "$GITHUB_ENV"
           fi
+
       # 用 npm（而非 pnpm）发布：pnpm v11+ 的 publish 是自研实现，尚不支持 OIDC
       # trusted publishing（pnpm/pnpm#9812）；npm CLI >= 11.5.1 才会自动检测 OIDC
       # 环境并完成认证与 provenance 生成。
+      #
       # 门禁由 package.json 的 prepublishOnly（typecheck + test + build）承担，
       # 故此处不再重复显式跑一遍，避免同一个 gate 执行两次。
-      - run: npm publish --provenance
+      - run: npm publish --provenance --access public
         if: env.skip != 'true'
