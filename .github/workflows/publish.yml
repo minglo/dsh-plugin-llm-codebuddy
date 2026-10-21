@@ -42,7 +42,9 @@ jobs:
       #   - 该版本已在 npm 上（重跑，或 tag 被推了两次）；
       #   - 这个包在 npm 上**根本不存在**，即首次发布。npm 不接受给尚不存在的包做
       #     OIDC 发布——trusted publisher 只能挂在已存在的包上，`npm publish` 会
-      #     直接回一个 404——所以首发必须手工做一次。见 README「发布」。
+      #     直接回一个 404——所以首发必须手工做一次（本地 `npm publish --access public`，
+      #     不要加 --provenance：本地没有 OIDC），随后到 npmjs.com 上把本仓库登记成
+      #     Trusted Publisher（workflow 文件名填 publish.yml），之后的版本才能走 CI。
       - name: Decide whether to publish
         run: |
           PKG="$(node -p "require('./package.json').name")"

@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-llm-codebuddy",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Tencent CodeBuddy LLM adapter for DeepSeek Harness",
   "keywords": [
     "dsh",
