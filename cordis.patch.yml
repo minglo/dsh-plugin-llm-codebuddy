@@ -1,0 +1,3 @@
+- insert:
+    - id: plugin-llm-codebuddy
+      name: 'dsh-plugin-llm-codebuddy'

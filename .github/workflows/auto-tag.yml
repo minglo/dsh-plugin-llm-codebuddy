@@ -1,0 +1,66 @@
+# 按 package.json 里的 version 打 tag，然后触发发布。
+#
+# 幂等且自限：tag 已存在则不动，该版本已在 npm 上则不动——所以往 main 推普通提交
+# 不会重复发布。要发版就把 package.json 的 version 抬一版再推。
+name: Auto Tag
+
+on:
+  push:
+    branches: [main]
+  # 手动补救：`gh workflow run auto-tag.yml`。必须留着，因为 tag 不会被后续的
+  # force-push 移动：main 被重写（squash 后强推）之后旧 tag 会指向一个已不在历史
+  # 里的提交，重跑本 workflow 才会把它重建到当前 head 上。它也是「tag 推上去了但
+  # dispatch 失败」时唯一的重试入口。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write   # gh workflow run publish.yml 需要触发 workflow_dispatch 的权限
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: ver
+        run: echo "v=v$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - id: pkg
+        run: echo "name=$(node -p "require('./package.json').name")" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and dispatch the release
+        run: |
+          TAG="${{ steps.ver.outputs.v }}"
+          PKG="${{ steps.pkg.outputs.name }}"
+
+          # 用 github.sha 当比对基准，因此不必先 fetch tags。
+          REMOTE="${{ github.sha }}"
+          EXISTING="$(git ls-remote --tags origin "refs/tags/$TAG" 2>/dev/null | cut -f1)"
+
+          if [ -n "$EXISTING" ]; then
+            # tag 指向的提交已不在 main 历史里 = 陈旧 tag（main 被重写后必然发生，
+            # 因为 force-push 不移动 tag）。这种情况要重建而不是跳过，否则发布
+            # 会指向一个谁也看不到的提交。
+            if git merge-base --is-ancestor "$EXISTING" "$REMOTE" 2>/dev/null; then
+              echo "tag $TAG 已指向历史内的提交，跳过"
+              exit 0
+            fi
+            echo "tag $TAG 指向 $EXISTING（不在历史内），删除后重建"
+            git push origin ":refs/tags/$TAG"
+          fi
+
+          if npm view "$PKG"@"${TAG#v}" version >/dev/null 2>&1; then
+            echo "版本 ${TAG#v} 已在 npm 上，跳过（抬一版 version 才会发布）"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+          # GITHUB_TOKEN 推的 tag 不触发 publish.yml 的 push 事件（防循环机制），
+          # 所以显式 dispatch；--ref 指向刚推的 tag，checkout 即为待发布提交。
+          gh workflow run publish.yml --ref "$TAG"
+        env:
+          GH_TOKEN: ${{ github.token }}
