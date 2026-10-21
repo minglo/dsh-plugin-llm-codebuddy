@@ -56,20 +56,29 @@ describe('serializeRequest', () => {
 describe('harness identity opener', () => {
   // CodeBuddy 网关按「渠道校验」核对调用方：system 提示以 dsh 的身份声明开头时，
   // 一律拒收（HTTP 400 · code=11128 · "Illegal API invocation from an unapproved
-  // channel"，界面文案是 "Request blocked. Please send it again"）。同一凭据去掉
-  // 这一句就立刻 200——所以出站前必须摘掉它。
-  it('drops the identity opener from a system message', () => {
+  // channel"，界面文案是 "Request blocked. Please send it again"）。同一凭据把
+  // 这句的指纹破坏掉就立刻 200——所以出站前必须改写它。
+  it('breaks the identity fingerprint in a system message', () => {
     const wire = serializeRequest({
       provider: 'codebuddy',
       model: 'm',
       messages: [{ role: 'system', content: [{ type: 'text', text: `${OPENER}\n\nYou are a coding agent powered by the m model.` }] }],
     }, false)
-    expect(wire.messages[0]).toEqual({ role: 'system', content: 'You are a coding agent powered by the m model.' })
+    expect(wire.messages[0]).toEqual({
+      role: 'system',
+      content: 'You are an AI agent, powered by DeepSeek Harness.\n\nYou are a coding agent powered by the m model.',
+    })
   })
 
-  it('drops the identity opener from options.system', () => {
+  it('breaks the identity fingerprint in options.system', () => {
     const wire = serializeRequest({ provider: 'codebuddy', model: 'm', messages: [], system: `${OPENER}\n\nrest` }, false)
-    expect(wire.messages[0]).toEqual({ role: 'system', content: 'rest' })
+    expect(wire.messages[0]).toEqual({ role: 'system', content: 'You are an AI agent, powered by DeepSeek Harness.\n\nrest' })
+  })
+
+  it('leaves the prompt alone when the endpoint is not CodeBuddy', () => {
+    // 自建网关/代理没有渠道校验，它的运营方应该看到 dsh 真正组装的提示。
+    const wire = serializeRequest({ provider: 'codebuddy', model: 'm', messages: [], system: `${OPENER}\n\nrest` }, false, false)
+    expect((wire.messages[0] as { content: string }).content).toBe(`${OPENER}\n\nrest`)
   })
 
   it('keeps a system prompt without the opener byte-identical', () => {
@@ -82,24 +91,14 @@ describe('harness identity opener', () => {
     expect((wire.messages[0] as { content: string }).content).toBe(text)
   })
 
-  it('keeps an opener that is not at the very start', () => {
-    // 上游只认「开头」那一句；不在开头就不构成拦截，原样送。
-    const text = `Hello. ${OPENER}`
+  it('neutralizes the product name even when the opener is not at the very start', () => {
+    // 上游只对开头那句整句比对，所以不在开头时不补逗号；但产品名照样要中和。
     const wire = serializeRequest({
       provider: 'codebuddy',
       model: 'm',
-      messages: [{ role: 'system', content: [{ type: 'text', text }] }],
+      messages: [{ role: 'system', content: [{ type: 'text', text: `Hello. ${OPENER}` }] }],
     }, false)
-    expect((wire.messages[0] as { content: string }).content).toBe(text)
-  })
-
-  it('omits a system message that carried nothing but the opener', () => {
-    const wire = serializeRequest({
-      provider: 'codebuddy',
-      model: 'm',
-      messages: [{ role: 'system', content: [{ type: 'text', text: OPENER }] }],
-    }, false)
-    expect(wire.messages.filter(message => message.role === 'system')).toEqual([])
+    expect((wire.messages[0] as { content: string }).content).toBe('Hello. You are an AI agent powered by the harness.')
   })
 })
 

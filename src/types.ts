@@ -158,6 +158,14 @@ export function hasDisclosedCapacity(model: CodeBuddyModel): boolean {
     && model.maxOutputTokens !== undefined && model.maxOutputTokens > 0
 }
 
+/** 按语言归档的一句成句文案。 */
+export interface WireWording {
+  zh?: string
+  en?: string
+  'zh-hant'?: string
+  [language: string]: string | undefined
+}
+
 /**
  * 非 2xx chat 回复携带的信封：服务自己的控制面形状，或自定义 `baseURL` 可能说的
  * OpenAI `{error: {...}}`。措辞散落在 `msg`、`extError`、`displayMsg` 三处，
@@ -175,13 +183,15 @@ export interface WireError {
     message?: string
     param?: string
   }
-  /** 按语言归档的、面向用户的成句文案。 */
-  displayMsg?: {
-    zh?: string
-    en?: string
-    'zh-hant'?: string
-    [language: string]: string | undefined
-  }
+  /** 按语言归档的、面向用户的成句文案：出了什么事。 */
+  displayMsg?: WireWording
+  /**
+   * 按语言归档的建议：该拿这个失败怎么办。
+   *
+   * 与 `displayMsg` 分开，因为它是**补救措辞**（「充值额度」「用官方客户端重发」），
+   * 不是失败状态本身——它只跟着陈述句上报，不参与失败分类。
+   */
+  displayTips?: WireWording
   /** OpenAI 兼容信封。 */
   error?: { message?: string; type?: string; code?: string }
 }

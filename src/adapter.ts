@@ -5,6 +5,8 @@ import {
 import type { GenerateOptions, LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, ResolvedRetryPolicy, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { deadline, idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import { CODEBUDDY_DISPLAY_NAME, CODEBUDDY_PRODUCT, CODEBUDDY_REPO_URL, PACKAGE_NAME, RATE_LIMIT_WAIT_CAP_MS, REQUEST_TIMEOUT_MS } from './constants.js'
+import { isCodeBuddyEndpoint } from './channel-fingerprint.js'
+import { curatedSentence, firstText, joinedMessage, wordingKeys } from './failure-message.js'
 import { serializeRequest } from './serialize.js'
 import { NotLoggedInError, SessionUnavailableError } from './session.js'
 import type { CodeBuddySession } from './session.js'
@@ -155,20 +157,6 @@ function waitMs(ms: number, signal: AbortSignal | undefined): Promise<void> {
   })
 }
 
-/**
- * 第一个携带非空文本的条目。
- *
- * 这里的类型检测是**承重**的，不是防御性冗余：按上报的语言 id 去查 `displayMsg`
- * 可能命中 `Object.prototype` 的继承成员（上报 `constructor` 就会取到那个函数），
- * 此时对它调 `.trim` 会抛错——从而丢掉整个信封、把错误码降级。
- */
-function firstText(values: readonly unknown[]): string | undefined {
-  for (const value of values) {
-    if (typeof value === 'string' && value.trim().length > 0) return value.trim()
-  }
-  return undefined
-}
-
 /** 一个失败信封的价值：要上报的一句话，以及供分类器读的文本。 */
 interface WireFailure {
   /** 上报语言下的成句文案，其次才是服务自己的字段。 */
@@ -176,21 +164,11 @@ interface WireFailure {
   /**
    * 信封携带的所有字段拼在一起。分类器匹配的是英文标识符子串，而各自读的字段不同：
    * 成句的 `displayMsg` 装着溢出措辞，provider 的 `msg` 装着配额措辞。
+   *
+   * **不含 `displayTips`**：那是补救措辞（「充值额度」「用官方客户端重发」），
+   * 混进来会让分类器把失败归到上游从没声称过的状态。
    */
   detail: string
-}
-
-/**
- * 一个语言 id 可能命名的 `displayMsg` 键，最优者在前。
- *
- * 服务把繁中文案只放在 `zh-hant` 下，而语言包按地区选它（`zh-TW`/`zh-HK`/`zh-MO`），
- * 所以这些 id 必须能到达该脚本键。按 `zh` 去读会让繁体读者收到简体。
- */
-function wordingKeys(language: string | undefined): readonly string[] {
-  const key = language?.trim().toLowerCase()
-  if (key === undefined || key.length === 0) return []
-  if (key === 'zh-tw' || key === 'zh-hk' || key === 'zh-mo') return [key, 'zh-hant']
-  return [key]
 }
 
 /**
@@ -202,17 +180,15 @@ function readWireFailure(body: WireError, language: string | undefined): WireFai
   const provider = body.extError
   const display = body.displayMsg
   const compatible = body.error
-  // 上报的语言 id 直接命名键；英文作为服务自己的默认。
-  const curated = firstText([
-    ...wordingKeys(language).map(key => display?.[key]),
-    display?.en,
-    display?.zh,
-  ])
-  const message = curated ?? firstText([
+  // `displayMsg` 说出了什么事，`displayTips` 说该怎么办；两半都可能缺席，建议跟在
+  // 陈述句后面而不是替换它。
+  const statement = curatedSentence(display, language) ?? firstText([
     body.msg,
     provider?.message,
     compatible?.message,
   ])
+  const tips = curatedSentence(body.displayTips, language)
+  const message = statement === undefined ? tips : joinedMessage(statement, tips)
   const detail = [
     body.code === undefined ? undefined : String(body.code),
     body.msg,
@@ -409,7 +385,9 @@ export class CodeBuddyAdapter extends LlmAdapter {
     if (options.tools !== undefined && options.tools.length > 0 && entry?.supportsToolCall === false) {
       throw new LlmError(`CodeBuddy model "${options.model}" does not support tool calls`, 'UNSUPPORTED_OPTION')
     }
-    const body = JSON.stringify(serializeRequest(options, supportsImages))
+    // 渠道校验的身份指纹只在 CodeBuddy 官方端点上生效：自建网关/代理没有那道
+    // 校验，它们的运营方应该看到 dsh 真正组装的提示，所以那里不改写。
+    const body = JSON.stringify(serializeRequest(options, supportsImages, isCodeBuddyEndpoint(connection.baseURL)))
     // 连接死线只护「建立连接 + 等响应头」这一阶段；响应体是长生命 SSE，由下面的
     // idleWatchdog 管，绝不能让一个总时长窗口在模型推理中途 abort 掉 body。
     let response!: Response

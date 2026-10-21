@@ -1,48 +1,10 @@
 import { contentHasImage, LlmError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm'
+import { rewriteHarnessIdentity } from './channel-fingerprint.js'
 import type { WireMessage, WireRequest, WireTool } from './types.js'
 
 function flattenText(blocks: readonly ContentBlock[]): string {
   return blocks.filter(block => block.type === 'text').map(block => block.text).join('')
-}
-
-/**
- * dsh 系统提示开头固定的一句身份声明（`@deepseek-ai/dsh-system-prompt` 的
- * `includeHarnessIdentity` 段，order −1000）。
- *
- * CodeBuddy 网关按「渠道校验」核对调用方：以这句开头的请求一律拒收——
- * HTTP 400 · `code=11128` · "Illegal API invocation from an unapproved channel"，
- * 界面文案是 "Request blocked. Please send it again"。这不是认证问题：同一凭据、
- * 同一请求头，只把这句去掉就立刻 200。
- *
- * 上游只认**开头**那一句（不在开头不构成拦截），且不区分大小写。
- */
-const HARNESS_IDENTITY_OPENER = /^You are an AI agent powered by DeepSeek Harness[^\n]*\r?\n?/i
-
-/**
- * 摘掉上游不认的身份声明开头。
- *
- * 只动开头：没命中就逐字节原样返回，别的系统提示一个字符都不改。
- * @param text - 原始 system 文本。
- * @returns 摘掉身份声明后的文本。
- */
-export function stripHarnessIdentity(text: string): string {
-  const stripped = text.replace(HARNESS_IDENTITY_OPENER, '')
-  // 只有真的摘掉了才顺带收掉留下的空行：没摘的提示必须原封不动。
-  return stripped === text ? text : stripped.replace(/^\s+/, '')
-}
-
-/**
- * 送出的 system 文本；`undefined` 表示这条 system 不该发。
- *
- * 整条只剩身份声明时不送空 system——空提示对上游没有意义，还可能被当成非法请求。
- * @param raw - 原始 system 文本。
- * @returns 送出的文本，或 undefined（不送这条）。
- */
-function wireSystemText(raw: string): string | undefined {
-  const stripped = stripHarnessIdentity(raw)
-  if (raw.length > 0 && stripped.length === 0) return undefined
-  return stripped
 }
 
 /**
@@ -124,14 +86,28 @@ function serializeAssistant(message: Extract<RequestMessage, { role: 'assistant'
   }
 }
 
-export function serializeMessages(messages: readonly RequestMessage[], supportsImages: boolean, hasTools: boolean): WireMessage[] {
+/**
+ * 把会话消息序列化成 CodeBuddy 的线上格式。
+ * @param messages - 按会话顺序排好的消息。
+ * @param supportsImages - 选中的模型是否声明了图片输入。
+ * @param hasTools - 本次请求是否带工具（决定历史 assistant 是否回传 reasoning_content）。
+ * @param rewriteIdentity - 是否破坏渠道校验的身份指纹。缺省按官方端点处理（改写）；
+ * 自建网关/代理没有那道校验，应显式传 false，让它们看到 dsh 真正组装的提示。
+ * @returns 线上格式的消息。
+ */
+export function serializeMessages(
+  messages: readonly RequestMessage[],
+  supportsImages: boolean,
+  hasTools: boolean,
+  rewriteIdentity = true,
+): WireMessage[] {
   const wire: WireMessage[] = []
   for (const message of humanInputLast(messages)) {
     // RequestUserInput（role:'user'、无 source）与 UserMessage 共用 user 分支。
     assertSupportedContent(message.content, supportsImages)
     if (message.role === 'system') {
-      const content = wireSystemText(flattenText(message.content))
-      if (content !== undefined) wire.push({ role: 'system', content })
+      const content = flattenText(message.content)
+      wire.push({ role: 'system', content: rewriteIdentity ? rewriteHarnessIdentity(content) : content })
       continue
     }
     if (message.role === 'assistant') {
@@ -153,13 +129,19 @@ export function serializeMessages(messages: readonly RequestMessage[], supportsI
   return wire
 }
 
-export function serializeRequest(options: GenerateOptions, supportsImages: boolean): WireRequest {
+/**
+ * 把一次生成请求序列化成 CodeBuddy 的线上格式。
+ * @param options - 宿主组装的生成请求。
+ * @param supportsImages - 选中的模型是否声明了图片输入。
+ * @param rewriteIdentity - 是否破坏渠道校验的身份指纹；见 {@link serializeMessages}。
+ * @returns 线上格式的请求。
+ */
+export function serializeRequest(options: GenerateOptions, supportsImages: boolean, rewriteIdentity = true): WireRequest {
   const messages: WireMessage[] = []
   if (options.system !== undefined) {
-    const content = wireSystemText(options.system)
-    if (content !== undefined) messages.push({ role: 'system', content })
+    messages.push({ role: 'system', content: rewriteIdentity ? rewriteHarnessIdentity(options.system) : options.system })
   }
-  messages.push(...serializeMessages(options.messages, supportsImages, options.tools !== undefined && options.tools.length > 0))
+  messages.push(...serializeMessages(options.messages, supportsImages, options.tools !== undefined && options.tools.length > 0, rewriteIdentity))
   const tools: WireTool[] | undefined = options.tools?.map(tool => ({
     type: 'function' as const,
     function: { name: tool.name, description: tool.description, parameters: tool.parameters },
