@@ -15,7 +15,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import { TYPERT_REMOTE } from '../remote-descriptors.js'
 import { PACKAGE_NAME, PLUGIN_NAME } from '../constants.js'
-import type { CodeBuddyModelsResult, LoginPoll, LoginStart, SettingsView, StatusView, UsageResult } from '../remote-types.js'
+import type { CodeBuddyModelsResult, CheckinResultView, CheckinStatusView, LoginPoll, LoginStart, SettingsView, StatusView, UsageResult } from '../remote-types.js'
 import { en, zh, type LocaleKey } from './locales.js'
 import { CodeBuddyTab, type CodeBuddyTabInjected } from './CodeBuddyTab.jsx'
 import { UsageIndicator, type UsageIndicatorInjected } from './UsageIndicator.jsx'
@@ -46,6 +46,10 @@ interface CodeBuddyRemote {
   getSettings(): Promise<RemoteResult<SettingsView>>
   models(): Promise<RemoteResult<CodeBuddyModelsResult>>
   setSettings(patch: { showUsage?: boolean; showComposerUsage?: boolean; waitOnRateLimit?: boolean; webSearch?: boolean }): Promise<RemoteResult<void>>
+  /** 今日签到态（读不到时 available=false）。 */
+  checkinStatus(): Promise<RemoteResult<CheckinStatusView>>
+  /** 执行今日签到。 */
+  checkin(): Promise<RemoteResult<CheckinResultView>>
 }
 
 export const NS = 'settings.codebuddy'

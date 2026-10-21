@@ -4,6 +4,9 @@ import { createElement } from 'react'
 
 vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
   Button: ({ children, ...rest }: { children?: unknown }) => createElement('button', rest, children),
+  // Toast 原语：真实实现走 portal 并自报完成。桩里渲染成一块带 text 的节点，
+  // 够断言「失败时出现了提示」；onDone 由调用方在动画结束后触发，这里不自动调。
+  Toast: ({ text }: { text: string }) => createElement('div', { role: 'status' }, text),
   // 按官方原语的真实 DOM 与回调语义做桩：button[role=switch][aria-checked]，
   // 点击时把**目标状态**交给 onChange（而不是让调用方自己取反）。
   Switch: ({ checked, onChange, label, disabled }: {

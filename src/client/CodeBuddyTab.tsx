@@ -3,11 +3,12 @@ import type { ReactNode } from 'react'
 import { Button, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { LoginPoll, LoginStart, SearchBackendState, SettingsView, StatusView, UsageResult, UsageView } from '../remote-types.js'
+import type { CheckinResultView, CheckinStatusView, LoginPoll, LoginStart, SearchBackendState, SettingsView, StatusView, UsageResult, UsageView } from '../remote-types.js'
 import { finiteOr, unwrap, withTimeout } from './shared.js'
 import { MORANDI } from './palette.js'
 import { UsageRings } from './UsageRings.jsx'
 import { emitLoginChange, emitUsagePrefChange } from './notifiers.js'
+import { useCheckin, type CheckinBinding } from './use-checkin.js'
 import { LOGIN_TIMEOUT_MS } from '../constants.js'
 
 /** 配置卡片单次远程读取的硬超时：host 挂住时不能让卡片永远停在加载态。 */
@@ -21,6 +22,10 @@ export interface CodeBuddyTabInjected {
     pollLogin(state: string): Promise<RemoteResult<LoginPoll>>
     logout(): Promise<RemoteResult<void>>
     getSettings(): Promise<RemoteResult<SettingsView>>
+    /** 今日签到态。 */
+    checkinStatus(): Promise<RemoteResult<CheckinStatusView>>
+    /** 执行今日签到。 */
+    checkin(): Promise<RemoteResult<CheckinResultView>>
   }
   setShowUsage(showUsage: boolean): Promise<void>
   /** 输入框工具行里的额度胶囊开关。 */
@@ -138,12 +143,27 @@ function StatusRow({ label, value }: { label: string; value: string }) {
  * 比整块消失好；但必须在上面挂一句「暂时读不到」，否则图例里那个 `50 / 0` 会被
  * 当成真实的「总额度是 0」。判据取两个分母都缺失，而不是原来的 `totalSize > 0`：
  * 那只够判断整体口径，而圆环还依赖本月口径。
+ *
+ * @param props - 读数、翻译函数，以及签到接线（缺省 = 圆心不可点）。
  */
-export function UsageMetrics({ view, t }: { view: UsageView; t: Translate }): ReactNode {
+export function UsageMetrics({ view, t, checkin }: {
+  view: UsageView
+  t: Translate
+  /** 签到接线；给出时圆心可点。 */
+  checkin?: CheckinBinding
+}): ReactNode {
   const degraded = finiteOr(view.totalSize, 0) <= 0 && finiteOr(view.monthPool?.size, 0) <= 0
   return h(Fragment, null,
     degraded ? h('p', { style: s.muted }, t('usageError')) : null,
-    h(UsageRings, { view, t }),
+    h(UsageRings, {
+      view,
+      t,
+      checked: checkin?.checked === true,
+      // 只有「读得到状态且账号参与活动」才给入口；否则圆心是纯展示。
+      ...(checkin?.available === true
+        ? { onCheckin: checkin.onCheckin, checkinPending: checkin.pending }
+        : {}),
+    }),
   )
 }
 
@@ -218,6 +238,9 @@ function CodeBuddyTabBody({ remote, setShowUsage, setShowComposerUsage, setWaitO
   }, [remote, t])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  // 签到：圆心可点。成功后重取读数（签到加了积分，额度变了）。
+  const checkin = useCheckin(remote, t, { onSuccess: refresh })
 
   // 开关初值：读远程 getSettings；失败沿用 schema 默认
   // （showUsage 关 / showComposerUsage 开 / waitOnRateLimit 关 / webSearch 关）。
@@ -404,7 +427,7 @@ function CodeBuddyTabBody({ remote, setShowUsage, setShowComposerUsage, setWaitO
               status?.enterpriseId !== undefined ? h(StatusRow, { label: t('enterpriseId'), value: status.enterpriseId }) : null,
               // 指标正文与输入框胶囊弹层共用同一个 UsageMetrics：两处入口渲染
               // 完全相同的字段，用户不会看到两份对不上的额度。
-              usage !== undefined ? h(UsageMetrics, { view: usage, t }) : h('p', { style: s.muted }, t('usageError')),
+              usage !== undefined ? h(UsageMetrics, { view: usage, t, checkin }) : h('p', { style: s.muted }, t('usageError')),
               h('div', { style: s.actions },
                 h(Button, { variant: 'outline', size: 'md', onClick: () => { void logout() } }, t('signOut')),
               ),
@@ -430,5 +453,6 @@ function CodeBuddyTabBody({ remote, setShowUsage, setShowComposerUsage, setWaitO
         ),
       )
 
-  return h('div', { className: 'cb-body' }, body)
+  // 失败提示条浮在页面顶端（Toast 自己走 portal），与正文并列渲染。
+  return h('div', { className: 'cb-body' }, body, checkin.toast)
 }

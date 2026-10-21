@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { render } from '@testing-library/react'
+import { render, fireEvent } from '@testing-library/react'
 import { createElement } from 'react'
 import type { UsageView } from '../src/remote-types.js'
-import { STROKE, UsageRings } from '../src/client/UsageRings.jsx'
+import { SIZE, STROKE, UsageRings, centerValueFontSize } from '../src/client/UsageRings.jsx'
 import { en, zh } from '../src/client/locales.js'
 import { EXPIRY_COLORS, MORANDI, monthColor } from '../src/client/palette.js'
 import { SEGMENT_GAP_RAD, daySegments } from '../src/client/usage-metrics.js'
@@ -40,8 +40,8 @@ function view(overrides: Partial<UsageView> = {}): UsageView {
   }
 }
 
-function renderRings(v: UsageView = view()) {
-  return render(createElement(UsageRings as never, { view: v, t }))
+function renderRings(v: UsageView = view(), checked = false, extra: { onCheckin?: () => void; checkinPending?: boolean } = {}) {
+  return render(createElement(UsageRings as never, { view: v, t, checked, ...extra }))
 }
 
 /**
@@ -89,8 +89,36 @@ describe('UsageRings（同心圆环）', () => {
   it('puts the total remaining credits in the centre', () => {
     const { container } = renderRings()
     const svg = container.querySelector('svg')
-    expect(svg?.textContent).toContain(en.totalBalance)
+    // 圆心用**短标签**：完整措辞在英文下 126.7px，圆心只有 95px 宽，放不下。
+    expect(svg?.textContent).toContain(en.totalBalanceShort)
     expect(svg?.textContent).toContain('1000')
+  })
+
+  it('keeps the full wording for the screen reader, where there is room', () => {
+    // 短标签是给眼睛看的（要放得下）；读屏用户拿到的是完整措辞，不必缩。
+    const { container } = renderRings()
+    const label = container.querySelector('svg')?.getAttribute('aria-label') ?? ''
+    expect(label).toContain(en.totalBalance)
+    expect(label).toContain('1000')
+  })
+
+  it('shrinks the centre value so a long balance still fits inside the disc', () => {
+    // 盘直径 79px，文字行所在高度上的弦长约 78.6px。6 位数在 20px 下宽 83.5px，
+    // 超出 → 必须收字号，否则数字横跨盘边，被切成两种颜色。
+    // 收窄而不是截断——截断会把读数本身改错。
+    expect(centerValueFontSize('1000')).toBe(20)
+    expect(centerValueFontSize('99999')).toBe(20)
+    expect(centerValueFontSize('999999')).toBe(16)
+    expect(centerValueFontSize('9999999')).toBe(14)
+    expect(centerValueFontSize('99999999')).toBe(12)
+    expect(centerValueFontSize('123456.78')).toBe(12)
+    expect(centerValueFontSize('1234567.89')).toBe(11)
+    // 渲染时字号真的收窄了，且**基线跟着抬**（否则这一行在盘里偏下）。
+    const { container } = renderRings(view({ totalBalance: 999999 }))
+    const value = container.querySelector('.cb-ring-center text:nth-of-type(2)')
+    expect(value?.getAttribute('style')).toContain('font-size: 16px')
+    const y = Number(value?.getAttribute('y'))
+    expect(y).toBeCloseTo(110 + 16 - (20 - 16) / 2, 6)
   })
 
   it('renders three concentric radii, inner to outer', () => {
@@ -311,8 +339,12 @@ describe('UsageRings（同心圆环）', () => {
   it('keeps each legend value next to its label instead of pushed to the far edge', () => {
     // 用户报的「label 与数值距离太远」：标签原来是 flex:1，会把数值一路推到容器
     // 最右边，容器越宽离得越远。改成网格后四列各自成列、列间距恒定 8px。
+    //
+    // 图例用 data-usage-legend 定位，而不是「第一个 div」：圆环外面还包了一层
+    // 放签到按钮的定位盒，第一个 div 是它，不是图例。
     const { container } = renderRings()
-    const legend = container.querySelector('[data-usage-rings] > div') as HTMLElement
+    const legend = container.querySelector('[data-usage-legend]') as HTMLElement
+    expect(legend).not.toBeNull()
     const style = legend.getAttribute('style') ?? ''
     expect(style).toContain('display: grid')
     expect(style).toContain('column-gap: 8px')
@@ -437,6 +469,189 @@ describe('UsageRings（同心圆环）', () => {
     expect(delays[0]).toBeLessThan(delays[1] as number)
     expect(delays[1]).toBeLessThan(delays[2] as number)
     expect(delayOf(container.querySelector('[data-ring-sweep]')!)).toBe(delays[2])
+  })
+
+  it('fills the centre from the inner ring when checked in', () => {
+    // 签到成功：圆心铺上填充色。填充圆的半径要让**它与第一环的间距**等于
+    // 另外两环之间的间距（RING_GAP = 8）——四层东西（中心盘 / 第一环 / 中环 /
+    // 外环）里只有这一处曾是零间距，看起来就像中心盘属于环而不属于中心。
+    const { container } = renderRings(view(), true)
+    const fill = container.querySelector('[data-checkin-fill]')
+    expect(fill).not.toBeNull()
+    expect(fill?.getAttribute('fill')).toBe(MORANDI.checked)
+    const r = Number(fill?.getAttribute('r'))
+    // 第一环：半径 54、描边 13 → 内缘 47.5、外缘 60.5。
+    // 中心盘 39.5 → 到内缘的净间距 47.5 − 39.5 = 8 = RING_GAP。
+    const innerEdge = 54 - STROKE / 2
+    expect(r).toBe(innerEdge - 8)
+    expect(innerEdge - r, '中心盘与第一环的间距应与另外两环一致').toBe(8)
+    // 且不能越过内缘：越过去就会盖住「已用积分」那条弧（另一个维度的数据）。
+    expect(r).toBeLessThan(innerEdge)
+    // 未签到：不渲染填充圆，也不渲染深墨文字层。
+    const plain = renderRings(view(), false)
+    expect(plain.container.querySelector('[data-checkin-fill]')).toBeNull()
+    expect(plain.container.querySelector('[data-checkin-ink]')).toBeNull()
+  })
+
+  it('grows the check-in fill on the same clock as the three rings', () => {
+    // 用户要的「动画过程时间和圆环一样」：填充与三环同一条 keyframes 曲线、
+    // 同一时长、同时起手（delay 0），读起来是一次动作而不是两段。
+    const { container } = renderRings(view(), true)
+    const css = container.ownerDocument.querySelector('style[data-plugin-css*="rings"]')?.textContent ?? ''
+    const ringDuration = Number(/cb-ring-grow\s+(\d+)ms/.exec(css)?.[1])
+    const fillDuration = Number(/cb-checkin-fill\s+(\d+)ms/.exec(css)?.[1])
+    expect(Number.isNaN(fillDuration), '样式表里应能读出填充动画时长').toBe(false)
+    expect(fillDuration).toBe(ringDuration)
+    // 同一条缓动曲线：把曲线改宽/改窄时两处必须一起变。
+    const ringEasing = /cb-ring-grow\s+\d+ms\s+([^;}]+)/.exec(css)?.[1]?.trim()
+    const fillEasing = /cb-checkin-fill\s+\d+ms\s+([^;}]+)/.exec(css)?.[1]?.trim()
+    expect(fillEasing).toBe(ringEasing)
+    // 缩放必须绕 viewBox 正中：绕 SVG 原点缩放时填充会从左上角长出来，
+    // 而不是从圆心「铺满」。
+    expect(css).toContain('transform-box:view-box')
+    expect(css).toContain(`transform-origin:${SIZE / 2}px ${SIZE / 2}px`)
+    // 动画只存在于 no-preference 守卫内：reduced-motion 下填充直接是满的。
+    const guard = css.slice(css.indexOf('prefers-reduced-motion'))
+    expect(guard).toContain('cb-checkin-fill')
+  })
+
+  it('reveals the dark centre text only where the fill already covers', () => {
+    // 填充是逐渐铺满的，中途背景半深半浅——任何单一文字色都有一段时间读不清
+    // （深墨在 40% 铺度的深色卡片上只有 1.8:1）。所以深墨文字层与填充圆**共用
+    // 同一个遮罩**：圆铺到哪里，深墨字才在哪里出现，对比度恒定。
+    const { container } = renderRings(view(), true)
+    const layer = container.querySelector('[data-checkin-layer]')
+    expect(layer).not.toBeNull()
+    // 填充圆与深墨文字必须在**同一个**被遮罩的组里——这是对比度恒定的唯一保证。
+    const maskRef = layer?.getAttribute('mask')
+    expect(maskRef).toMatch(/^url\(#cb-checkin-/)
+    const ink = container.querySelector('[data-checkin-ink]')
+    expect(ink).not.toBeNull()
+    expect(layer?.contains(ink)).toBe(true)
+    expect(layer?.contains(container.querySelector('[data-checkin-fill]'))).toBe(true)
+
+    const mask = container.ownerDocument.getElementById(maskRef!.slice(5, -1))
+    expect(mask).not.toBeNull()
+    // 遮罩内容是「全黑底 + 一个白圆」：白圆正是被动画缩放的那一个。
+    expect(mask?.querySelector('rect')?.getAttribute('fill')).toBe('#000')
+    const white = mask?.querySelector('circle')
+    expect(white?.getAttribute('fill')).toBe('#fff')
+    expect(white?.getAttribute('class')).toBe('cb-checkin-fill')
+
+    // 两层文字是同一份内容（标签 + 数值），只是颜色不同——不能出现「签到后数字
+    // 变了」或「少了一行」。
+    const themed = container.querySelector('.cb-ring-center')
+    expect(themed?.textContent).toBe(ink?.textContent)
+    // 深墨文字两行的 fill 都必须是那支固定墨色，而不是主题 token。
+    // jsdom 会把 #16201b 归一化成 rgb(22, 32, 27)，故按 rgb 形式断。
+    for (const text of Array.from(ink!.querySelectorAll('text'))) {
+      expect(text.getAttribute('style')).toContain('rgb(22, 32, 27)')
+    }
+  })
+
+  it('keeps the centre readable when checked in under reduced motion', () => {
+    // 静态几何必须自成一体：不播动画时填充圆是不透明的、遮罩是全开的，
+    // 深墨文字直接落在满色圆上（4.77:1），而不是悬在半透明背景上。
+    const { container } = renderRings(view(), true)
+    const fill = container.querySelector('[data-checkin-fill]')!
+    // 静态态没有 opacity/半透明修饰：fill 是实色，字是实色。
+    expect(fill.getAttribute('fill')).toBe(MORANDI.checked)
+    expect(fill.getAttribute('style') ?? '').not.toContain('opacity')
+  })
+
+  it('paints the fill above the themed text, so the two never show through each other', () => {
+    // 主题色文字在 DOM 里必须**排在填充层之前**：填充层是「盖住」它，不是「垫在
+    // 它下面」。顺序反了的话，签到后主题色的浅灰字会浮在绿色上，深墨字又叠在
+    // 浅灰字上，两个颜色一起看就是重影。
+    const { container } = renderRings(view(), true)
+    const themed = container.querySelector('.cb-ring-center')!
+    const layer = container.querySelector('[data-checkin-layer]')!
+    // compareDocumentPosition：themed 在 layer 之前 → 前者的 DOCUMENT_POSITION_FOLLOWING
+    // 标志为 1。
+    const relation = themed.compareDocumentPosition(layer)
+    expect(relation & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('paints the fill below the rings, so the seam at the inner edge stays clean', () => {
+    // 填充圆半径 47.5 = 第一环内缘，两者相切。若填充画在环之后，相切处两条抗锯齿
+    // 边互相混色，缝里出现一道脏边；画在环之前则由环的描边压住接缝。
+    const { container } = renderRings(view(), true)
+    const layer = container.querySelector('[data-checkin-layer]')!
+    // 第一环的轨道：r=54 且带描边，是「已用积分」那一环的底。
+    const innerTrack = Array.from(container.querySelectorAll('circle'))
+      .find(circle => Number(circle.getAttribute('r')) === 54 && circle.getAttribute('stroke') === 'var(--dsw-alias-border-l2)')
+    expect(innerTrack).toBeDefined()
+    const relation = layer.compareDocumentPosition(innerTrack!)
+    expect(relation & Node.DOCUMENT_POSITION_FOLLOWING, '填充层应排在第一环轨道之前').toBeTruthy()
+  })
+
+  describe('圆心的签到按钮', () => {
+    it('没给签到回调时圆心不可点（纯展示）', () => {
+      const { container } = renderRings(view())
+      expect(container.querySelector('.cb-checkin-hit')).toBeNull()
+    })
+
+    it('给了回调时圆心是一个真的按钮，盖住填充圆盘', () => {
+      const { container } = renderRings(view(), false, { onCheckin: () => {} })
+      const hit = container.querySelector('.cb-checkin-hit') as HTMLButtonElement
+      expect(hit).not.toBeNull()
+      expect(hit.tagName).toBe('BUTTON')
+      // 尺寸＝填充盘直径：按钮正好盖住那块圆盘。
+      expect(hit.style.width).toBe('79px')
+      expect(hit.style.height).toBe('79px')
+      // 浮在 SVG 之上（position:absolute + 居中），否则点不到。
+      expect(hit.style.position).toBe('absolute')
+      // 未签到时可点。
+      expect(hit.disabled).toBe(false)
+    })
+
+    it('点圆心触发签到', () => {
+      const calls: number[] = []
+      const { container } = renderRings(view(), false, { onCheckin: () => { calls.push(1) } })
+      const hit = container.querySelector('.cb-checkin-hit') as HTMLButtonElement
+      fireEvent.click(hit)
+      expect(calls).toHaveLength(1)
+    })
+
+    it('已签到时按钮 disabled，点击不响应', () => {
+      // 用户的要求：「已签到点击就不响应」。用 disabled 而不是「点了没反应」的假按钮：
+      // 键盘用户也拿不到焦点，读屏软件会念出「不可用」。
+      const calls: number[] = []
+      const { container } = renderRings(view(), true, { onCheckin: () => { calls.push(1) } })
+      const hit = container.querySelector('.cb-checkin-hit') as HTMLButtonElement
+      expect(hit.disabled).toBe(true)
+      fireEvent.click(hit)
+      expect(calls).toHaveLength(0)
+    })
+
+    it('请求在飞时按钮 disabled：防双击发出两次写请求', () => {
+      const calls: number[] = []
+      const { container } = renderRings(view(), false, { onCheckin: () => { calls.push(1) }, checkinPending: true })
+      const hit = container.querySelector('.cb-checkin-hit') as HTMLButtonElement
+      expect(hit.disabled).toBe(true)
+      fireEvent.click(hit)
+      expect(calls).toHaveLength(0)
+    })
+
+    it('按钮的无障碍名随状态变化', () => {
+      const t2 = (key: string) => en[key as keyof typeof en] ?? key
+      const idle = render(createElement(UsageRings as never, { view: view(), t: t2, onCheckin: () => {} }))
+      expect(idle.container.querySelector('.cb-checkin-hit')?.getAttribute('aria-label')).toBe(en.checkinCta)
+      const done = render(createElement(UsageRings as never, { view: view(), t: t2, checked: true, onCheckin: () => {} }))
+      expect(done.container.querySelector('.cb-checkin-hit')?.getAttribute('aria-label')).toBe(en.checkinDone)
+      const busy = render(createElement(UsageRings as never, { view: view(), t: t2, onCheckin: () => {}, checkinPending: true }))
+      expect(busy.container.querySelector('.cb-checkin-hit')?.getAttribute('aria-label')).toBe(en.checkinPending)
+    })
+
+    it('按钮是 HTML 按钮而不是 SVG 里的 g：role=img 的子树对读屏是装饰性的', () => {
+      // SVG 的 role="img" 会让整棵子树对读屏软件变成装饰性的——签到按钮若在里面，
+      // 键盘用户永远到不了。所以它必须浮在 SVG 之外。
+      const { container } = renderRings(view(), false, { onCheckin: () => {} })
+      const hit = container.querySelector('.cb-checkin-hit')!
+      expect(hit.closest('svg')).toBeNull()
+      // 且 SVG 仍然是 role="img"（读屏拿到的是一句话总结）。
+      expect(container.querySelector('svg')?.getAttribute('role')).toBe('img')
+    })
   })
 
 })

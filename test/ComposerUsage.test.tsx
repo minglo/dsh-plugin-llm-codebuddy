@@ -7,6 +7,9 @@ import { USAGE_REFRESH_MS } from '../src/client/usage-feed.js'
 // Modal 是 portal + 遮罩 + Escape 的官方实现；这里只关心「谁渲染了什么」，
 // 所以按 open/onClose/className 语义做透传桩，不复制它的焦点管理。
 vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
+  // Toast 原语：真实实现走 portal 并自报完成。桩里渲染成一块带 text 的节点，
+  // 够断言「失败时出现了提示」；onDone 由调用方在动画结束后触发，这里不自动调。
+  Toast: ({ text }: { text: string }) => createElement('div', { role: 'status' }, text),
   Modal: ({ open, onClose, title, children, className }: {
     open: boolean; onClose: () => void; title: string; children?: unknown; className?: string
   }) => (open
@@ -41,11 +44,21 @@ const view = {
   details: [],
 }
 
-function makeRemote(options: { composer?: boolean; usage?: () => Promise<unknown> } = {}) {
+function makeRemote(options: {
+  composer?: boolean
+  usage?: () => Promise<unknown>
+  checkinStatus?: () => Promise<unknown>
+  checkin?: () => Promise<unknown>
+} = {}) {
   return {
     // 每个用例一个新对象：usageFeed 按 remote 身份缓存，新对象 = 新 feed = 干净状态。
     usage: (options.usage as never) ?? (async () => ok({ loggedIn: true, view, fetchedAt: 1_700_000_000_000 })),
     getSettings: async () => ok({ showUsage: true, showComposerUsage: options.composer ?? true, webSearch: false }),
+    // 签到面：缺省给「读得到、活动开着、今天还没签」的桩，于是圆心默认可点。
+    checkinStatus: (options.checkinStatus as never) ?? (async () => ok({
+      available: true, active: true, checkedIn: false, streakDays: 20, dailyCredit: 100, todayCredit: 0,
+    })),
+    checkin: (options.checkin as never) ?? (async () => ok({ success: true, credit: 100, streakDays: 21 })),
   }
 }
 
@@ -201,8 +214,55 @@ describe('ComposerUsage（输入框工具行的额度胶囊）', () => {
     expect(usage).toHaveBeenCalledTimes(2)
   })
 
+  it('点圆心签到：成功则圆心铺色、按钮停用，并刷新读数', async () => {
+    // 用户的要求串成一条：点圆心 → 签到成功 → 颜色变了（圆心铺填充）→ 读数刷新。
+    let checked = false
+    const usage = vi.fn(async () => ok({ loggedIn: true, view }))
+    const checkin = vi.fn(async () => {
+      checked = true
+      return ok({ success: true, credit: 100, streakDays: 21 })
+    })
+    const checkinStatus = vi.fn(async () => ok({
+      available: true, active: true, checkedIn: checked, streakDays: 20, dailyCredit: 100, todayCredit: 0,
+    }))
+    renderPill(makeRemote({ usage, checkin, checkinStatus }))
+    await settle()
+    fireEvent.click(trigger())
+    // 用弹层元素本身做 DOM 查询：within() 只给角色查询，不给 querySelector。
+    const dialog = screen.getByRole('dialog')
+    await waitFor(() => { expect(dialog.querySelector('.cb-checkin-hit')).not.toBeNull() })
+
+    // 未签到时圆心可点，且没有填充层。
+    const hit = dialog.querySelector('.cb-checkin-hit') as HTMLButtonElement
+    expect(hit.disabled).toBe(false)
+    expect(dialog.querySelector('[data-checkin-layer]')).toBeNull()
+
+    fireEvent.click(hit)
+    // 签到成功后：圆心铺上填充色、按钮停用（已签到点击不响应）。
+    await waitFor(() => { expect(dialog.querySelector('[data-checkin-layer]')).not.toBeNull() })
+    expect((dialog.querySelector('.cb-checkin-hit') as HTMLButtonElement).disabled).toBe(true)
+    expect(checkin).toHaveBeenCalledTimes(1)
+    // 读数刷新：签到加了积分，额度读数过期。
+    await waitFor(() => { expect(usage.mock.calls.length).toBeGreaterThan(2) })
+  })
+
+  it('签到失败才提示；成功不提示', async () => {
+    const checkin = vi.fn(async () => ok({ success: false, message: '活动未开启', credit: 0, streakDays: 0 }))
+    renderPill(makeRemote({ checkin }))
+    await settle()
+    fireEvent.click(trigger())
+    const dialog = screen.getByRole('dialog')
+    await waitFor(() => { expect(dialog.querySelector('.cb-checkin-hit')).not.toBeNull() })
+    fireEvent.click(dialog.querySelector('.cb-checkin-hit') as HTMLButtonElement)
+
+    // 失败：出现提示，且圆心不变色（没有填充层）。
+    await waitFor(() => { expect(screen.getByRole('status')).not.toBeNull() })
+    expect(screen.getByRole('status').textContent).toContain(en.checkinFailed)
+    expect(screen.getByRole('status').textContent).toContain('活动未开启')
+    expect(dialog.querySelector('[data-checkin-layer]')).toBeNull()
+  })
+
   it('弹窗开着时后台刷新失败，弹窗不会凭空消失', async () => {
-    // 回归：网关抖一下就让用户正看着的弹窗关掉，是最难接受的一种失败。
     const usage = vi.fn(async () => ok({ loggedIn: true, view }))
     renderPill(makeRemote({ usage }))
     await settle()

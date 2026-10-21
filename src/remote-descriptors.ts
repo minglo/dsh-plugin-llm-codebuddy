@@ -177,6 +177,27 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
         })),
       }),
     }),
+    direct('checkinStatus', {
+      result: z.object({
+        // available（读到了吗）与 active（账号参与这个活动吗）是两件事，
+        // 都要在 wire 上分开：前者为假时客户端连入口都不给。
+        available: z.boolean(),
+        active: z.boolean(),
+        checkedIn: z.boolean(),
+        streakDays: z.number(),
+        dailyCredit: z.number(),
+        todayCredit: z.number(),
+      }),
+    }),
+    direct('checkin', {
+      result: z.object({
+        success: z.boolean(),
+        // optional：成功时服务端不一定带 message。
+        message: z.string().optional(),
+        credit: z.number(),
+        streakDays: z.number(),
+      }),
+    }),
   ],
 }
 

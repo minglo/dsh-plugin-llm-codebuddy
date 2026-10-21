@@ -12,6 +12,17 @@ export const zh = {
   tenantId: '租户',
   enterpriseId: '企业 ID',
   totalBalance: '总剩余积分',
+  /**
+   * 圆环中心的**短标签**。
+   *
+   * 完整措辞「总剩余积分」/「Total remaining credits」在英文下宽 126.7px，
+   * 而圆心那块地盘只有 95px（第一环内缘）——标签会横跨盘边，一句话被切成
+   * 两半颜色。短标签两种语言都放得下（中文 34px / 英文 58.4px）。
+   *
+   * 与 composerUsageShort 同理：完整措辞留给 tooltip 与 aria-label（那里有
+   * 宽度），圆心只放放得下的短的那一版。
+   */
+  totalBalanceShort: '总剩余',
   totalUsed: '已用积分',
   monthPoolRemain: '本月剩余',
   monthSize: '本月到期',
@@ -50,6 +61,14 @@ export const zh = {
   // 也不要把两者都写进去——那句话会到 408px，撑破窄弹窗的单行约束（见 .cb-usage-note）。
   composerUsageHint: '读数每 60 秒刷新一次',
   composerUsageUnavailable: '暂时读不到额度数据，稍后会自动重试。',
+  // 签到（圆心可点）。三态各自一句话：可点 / 已在飞 / 已完成。
+  // 「已签到」与「未签到」靠**颜色**区分（灰绿圆盘 vs 干净圆心），文案只补
+  // 键盘与读屏用户拿不到的那部分信息。
+  checkinCta: '签到',
+  checkinDone: '今日已签到',
+  checkinPending: '签到中…',
+  /** 签到失败的兜底文案。服务端的原因另附在后面（若有）。 */
+  checkinFailed: '签到失败，请重试。',
   webSearch: '使用 CodeBuddy 搜索',
   webSearchDesc: '用 CodeBuddy 网关接管 web_search 与 web_fetch；关闭后自动还原为原来的搜索提供方。',
   // 生效态徽标：读的是实际接管结果，不是开关意图。
@@ -81,6 +100,10 @@ export const en = {
   tenantId: 'Tenant',
   enterpriseId: 'Enterprise ID',
   totalBalance: 'Total remaining credits',
+  // Short label for the ring centre: the full wording is 126.7px wide and the
+  // centre disc is only 95px across, so the label would straddle the disc edge
+  // and get sliced into two colours. See totalBalanceShort in the zh table.
+  totalBalanceShort: 'Remaining',
   totalUsed: 'Used credits',
   monthPoolRemain: 'Remaining this month',
   monthSize: 'Expiring this month',
@@ -119,6 +142,15 @@ export const en = {
   // Spelling out both would reach ~408px and break the note's single-line rule.
   composerUsageHint: 'Refreshes every 60 seconds',
   composerUsageUnavailable: 'Allowance data is temporarily unavailable; it will retry automatically.',
+  // Check-in (the ring centre is the button). One phrase per state: clickable /
+  // in flight / already done. "Checked in" vs "not checked in" is told apart by
+  // COLOUR (the grey-green disc vs a clean centre); the words only carry what a
+  // keyboard or screen-reader user cannot see.
+  checkinCta: 'Check in',
+  checkinDone: 'Checked in today',
+  checkinPending: 'Checking in…',
+  /** Fallback copy for a failed check-in. The server's reason is appended after it. */
+  checkinFailed: 'Check-in failed. Please try again.',
   webSearch: 'Search with CodeBuddy',
   webSearchDesc: 'Route web_search and web_fetch through the CodeBuddy gateway; turning it off restores the previous search provider.',
   // Effective-state badge: reports the actual takeover, not the switch intent.

@@ -21,19 +21,24 @@ import { Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { SettingsView, UsageResult } from '../remote-types.js'
+import type { CheckinResultView, CheckinStatusView, SettingsView, UsageResult } from '../remote-types.js'
 import { CODEBUDDY_PROVIDER } from '../constants.js'
 import { subscribeUsagePrefChange } from './notifiers.js'
 import { formatCredits, unwrap } from './shared.js'
 import { monthColor } from './palette.js'
 import { toReading } from './usage-metrics.js'
 import { EMPTY_USAGE_SNAPSHOT, usageFeed, type UsageSnapshot } from './usage-feed.js'
+import { useCheckin } from './use-checkin.js'
 import { UsageMetrics } from './CodeBuddyTab.jsx'
 
 export interface ComposerUsageInjected {
   remote: {
     usage(): Promise<RemoteResult<UsageResult>>
     getSettings(): Promise<RemoteResult<SettingsView>>
+    /** 今日签到态。 */
+    checkinStatus(): Promise<RemoteResult<CheckinStatusView>>
+    /** 执行今日签到。 */
+    checkin(): Promise<RemoteResult<CheckinResultView>>
   }
   t: (key: string) => string
 }
@@ -95,6 +100,13 @@ export function ComposerUsage({ remote, t, useProjection }: Props): ReactNode {
   const reading = snapshot.loggedIn ? toReading(snapshot.view) : undefined
 
   /**
+   * 签到：弹层里的圆心可点。成功后重取读数（签到加了积分，额度变了）。
+   *
+   * `enabled` 跟胶囊同一个开关：关掉时既不订阅签到态、也不产生任何外呼。
+   */
+  const checkin = useCheckin(remote, t, { enabled, onSuccess: () => feed.read() })
+
+  /**
    * 打开弹窗时**主动读一次**。
    *
    * 打开是「用户现在就要看」的显式意图，等下一轮 10 秒定时器才更新是错的——
@@ -153,7 +165,7 @@ export function ComposerUsage({ remote, t, useProjection }: Props): ReactNode {
         // 比给一串上一秒还正确的旧数字更诚实。
         snapshot.view === undefined
           ? h('p', { className: 'cb-usage-error' }, t('composerUsageUnavailable'))
-          : h(UsageMetrics, { view: snapshot.view, t }),
+          : h(UsageMetrics, { view: snapshot.view, t, checkin }),
         // 单行说明：「更新于 <时刻> 读数每 60 秒刷新一次」。
         // 不要再加分隔符或补语——文案要短到能稳定占一行（.cb-usage-note 带 nowrap）。
         // 也不能替用户把「界面每 10 秒取一次」补进去：那句话量出来 408px，会撑破窄弹窗。
@@ -164,6 +176,8 @@ export function ComposerUsage({ remote, t, useProjection }: Props): ReactNode {
             ),
       ),
     ),
+    // 失败提示条浮在页面顶端（Toast 自己走 portal），与胶囊并列渲染。
+    checkin.toast,
   )
 }
 

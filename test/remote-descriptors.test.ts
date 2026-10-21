@@ -2,8 +2,7 @@ import { describe, expect, it } from 'vitest'
 import TYPERT_REMOTE from '../src/remote-descriptors.js'
 import type { TypertCodec } from '@deepseek-ai/dsh-typert-protocol'
 
-const METHODS = ['status', 'usage', 'startLogin', 'pollLogin', 'logout', 'getSettings', 'setSettings', 'models'] as const
-
+const METHODS = ['status', 'usage', 'startLogin', 'pollLogin', 'logout', 'getSettings', 'setSettings', 'models', 'checkinStatus', 'checkin'] as const
 function asStrict(codec: TypertCodec): Extract<TypertCodec, { mode: 'strict' }> {
   if (codec.mode !== 'strict') throw new Error(`expected strict codec, got mode ${codec.mode}`)
   return codec
@@ -47,11 +46,20 @@ const samples: Record<string, unknown> = {
   getSettings: { showUsage: true, showComposerUsage: false, webSearch: false },
   setSettings: {},
   models: { loggedIn: true, models: [] },
+  checkinStatus: {
+    available: true,
+    active: true,
+    checkedIn: false,
+    streakDays: 3,
+    dailyCredit: 50,
+    todayCredit: 0,
+  },
+  checkin: { success: true, credit: 50, streakDays: 4 },
 }
 
 describe('TYPERT_REMOTE (client remote descriptors)', () => {
-  it('declares exactly the eight codebuddy methods', () => {
-    expect(TYPERT_REMOTE.descriptors).toHaveLength(8)
+  it('declares exactly the ten codebuddy methods', () => {
+    expect(TYPERT_REMOTE.descriptors).toHaveLength(10)
     const methods = TYPERT_REMOTE.descriptors.map(d => d.method)
     expect(methods).toEqual([...METHODS])
   })
@@ -196,6 +204,37 @@ describe('TYPERT_REMOTE (client remote descriptors)', () => {
         }],
       }) as { models: Array<{ id: string, promotion?: { label: string } }> }
       expect(decoded.models[0]?.promotion?.label).toBe('限时免费')
+    })
+  })
+
+  describe('checkin', () => {
+    it('checkinStatus carries the availability flags separately', () => {
+      // available（读到了吗）与 active（账号参与活动吗）必须是两件事：
+      // 前者假 → 不给入口；后者假 → 入口在、点了会失败。
+      const descriptor = TYPERT_REMOTE.descriptors.find(d => d.method === 'checkinStatus')
+      expect(descriptor).toBeDefined()
+      if (!descriptor) return
+      const schema = schemaOf(asStrict(descriptor.result))
+      expect(schema.parse({
+        available: true, active: true, checkedIn: false, streakDays: 0, dailyCredit: 50, todayCredit: 0,
+      })).toEqual({
+        available: true, active: true, checkedIn: false, streakDays: 0, dailyCredit: 50, todayCredit: 0,
+      })
+      // 活动没开：available 仍为真（读到了），active 为假。
+      expect(schema.parse({
+        available: true, active: false, checkedIn: false, streakDays: 0, dailyCredit: 0, todayCredit: 0,
+      }).active).toBe(false)
+    })
+
+    it('checkin tolerates a missing server message', () => {
+      // 成功时服务端不一定带 message；缺了必须能 decode（否则客户端整条链路挂掉）。
+      const descriptor = TYPERT_REMOTE.descriptors.find(d => d.method === 'checkin')
+      expect(descriptor).toBeDefined()
+      if (!descriptor) return
+      const schema = schemaOf(asStrict(descriptor.result))
+      expect(schema.parse({ success: true, credit: 50, streakDays: 1 })).toEqual({ success: true, credit: 50, streakDays: 1 })
+      expect(schema.parse({ success: false, message: '活动未开启', credit: 0, streakDays: 0 }))
+        .toEqual({ success: false, message: '活动未开启', credit: 0, streakDays: 0 })
     })
   })
 

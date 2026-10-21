@@ -51,6 +51,44 @@ export interface UsageResult {
   fetchedAt?: number
 }
 
+/**
+ * 今日签到态（宿主与客户端共享的 wire 类型，唯一来源）。
+ *
+ * `available` 与 `active` 是两件事：**接口读得到**（available）与**账号参与这个
+ * 活动**（active）。前者为假时客户端连签到入口都不给（省一次无谓外呼），
+ * 后者为假时入口在、但点了会失败。
+ */
+export interface CheckinStatusView {
+  /** 宿主是否成功读到了签到态（未登录 / 接口不可读时为 false）。 */
+  available: boolean
+  /** 活动是否开启。 */
+  active: boolean
+  /** 今日是否已签到。 */
+  checkedIn: boolean
+  /** 连签天数（0 = 无从得知）。 */
+  streakDays: number
+  /** 今日签到可得积分。 */
+  dailyCredit: number
+  /** 今日已得积分。 */
+  todayCredit: number
+}
+
+/**
+ * 一次签到的结果（宿主与客户端共享的 wire 类型，唯一来源）。
+ *
+ * `message` 是服务端原文（可能是「今日已签到」「活动未开启」），**不翻译**：
+ * 客户端只在确实失败时把它当作补充说明，主文案仍用本地化的那一句。
+ */
+export interface CheckinResultView {
+  success: boolean
+  /** 失败原因（成功时缺省）。 */
+  message?: string
+  /** 本次签到得到的积分。 */
+  credit: number
+  /** 签到后的连签天数。 */
+  streakDays: number
+}
+
 export interface SettingsView {
   showUsage: boolean
   /**

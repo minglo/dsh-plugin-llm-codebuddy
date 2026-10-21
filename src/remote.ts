@@ -2,6 +2,7 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { Context } from '@deepseek-ai/cordis'
 import { readGrant, recordKey } from './auth.js'
 import type { CodeBuddyGrant } from './auth.js'
+import { fetchCheckinStatus, performCheckin } from './checkin.js'
 import { fetchUsage, UsageAuthExpiredError } from './usage.js'
 import { UsageCache, usageCacheKey } from './usage-cache.js'
 import { decodeJwtPayload, resolveIdentity } from './jwt.js'
@@ -12,8 +13,24 @@ import { readSettings, updateSettings } from './settings-ns.js'
 import type { CodeBuddySettings } from './settings-ns.js'
 import { effectiveRate, promotionFor, tierFor, windowTextOf } from './promotions.js'
 import type { CodeBuddyPromotion, CodeBuddyTier } from './types.js'
-import type { CodeBuddyModelEntry, CodeBuddyModelsResult, LocalizedText, LoginPoll, LoginStart, PromotionView, SearchBackendState, SettingsView, StatusView, TierView, UsageResult } from './remote-types.js'
+import type { CodeBuddyModelEntry, CodeBuddyModelsResult, CheckinResultView, CheckinStatusView, LocalizedText, LoginPoll, LoginStart, PromotionView, SearchBackendState, SettingsView, StatusView, TierView, UsageResult } from './remote-types.js'
 import { USAGE_CACHE_TTL_MS } from './constants.js'
+
+/**
+ * 「签到态读不到」的回执。
+ *
+ * 全字段是常量而非每次新建：wire 上它是普通对象，客户端只读字段，不需要引用
+ * 稳定；但复用同一个对象可以让「读不到」这一态在多次调用间是**同一个值**，
+ * 客户端的快照比对不会因为每次返回新对象而误判成「变了」。
+ */
+const UNAVAILABLE_CHECKIN: CheckinStatusView = {
+  available: false,
+  active: false,
+  checkedIn: false,
+  streakDays: 0,
+  dailyCredit: 0,
+  todayCredit: 0,
+}
 
 /**
  * 徽标缺颜色时的兜底：中性灰。
@@ -164,6 +181,49 @@ export class CodeBuddyRemoteService extends TypertRemoteService {
   @Remote
   async setSettings(patch: { showUsage?: boolean; showComposerUsage?: boolean; waitOnRateLimit?: boolean; webSearch?: boolean }): Promise<void> {
     await updateSettings(this.ctx, patch)
+  }
+
+  /**
+   * 读今日签到态。
+   *
+   * 未登录 / 接口读不到时返回 `available: false`——**读不到**与**活动没开**是
+   * 两回事，客户端据此决定要不要给签到入口。
+   */
+  @Remote
+  async checkinStatus(): Promise<CheckinStatusView> {
+    const grant = await readGrant(this.ctx)
+    if (grant === undefined) return UNAVAILABLE_CHECKIN
+    const identity = await this.options.session.identity()
+    const status = await fetchCheckinStatus(identity)
+    if (status === undefined) return UNAVAILABLE_CHECKIN
+    return {
+      available: true,
+      active: status.active,
+      checkedIn: status.checkedIn,
+      streakDays: status.streakDays,
+      dailyCredit: status.dailyCredit,
+      todayCredit: status.todayCredit,
+    }
+  }
+
+  /**
+   * 执行今日签到。
+   *
+   * 失败时把服务端的原因原样带回（客户端只在失败时用它做补充说明），
+   * 成功时带回本次得到的积分与连签天数。
+   */
+  @Remote
+  async checkin(): Promise<CheckinResultView> {
+    const grant = await readGrant(this.ctx)
+    if (grant === undefined) return { success: false, message: 'not signed in', credit: 0, streakDays: 0 }
+    const identity = await this.options.session.identity()
+    const outcome = await performCheckin(identity)
+    return {
+      success: outcome.success,
+      ...(outcome.message === undefined ? {} : { message: outcome.message }),
+      credit: outcome.credit,
+      streakDays: outcome.streakDays,
+    }
   }
 
   /**

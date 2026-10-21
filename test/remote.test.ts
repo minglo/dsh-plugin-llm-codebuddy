@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { CodeBuddyRemoteService } from '../src/remote.js'
 import * as codebuddy from '../src/codebuddy.js'
 import * as usage from '../src/usage.js'
+import * as checkin from '../src/checkin.js'
 import type { CodeBuddyIdentity } from '../src/codebuddy.js'
 import type { CodeBuddyGrant } from '../src/auth.js'
 import type { CodeBuddySession } from '../src/session.js'
@@ -206,6 +207,76 @@ describe('CodeBuddyRemoteService', () => {
 
       // 不缓存：开关/登录/接管的任何变化都必须在下一次读数里体现。
       expect(probe).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  describe('checkin', () => {
+    it('checkinStatus reports unavailable when no grant is stored', async () => {
+      const ctx = await setupScratch()
+      const { session, identity } = sessionStub()
+      const svc = new CodeBuddyRemoteService(ctx, { session })
+
+      await expect(svc.checkinStatus()).resolves.toEqual({
+        available: false, active: false, checkedIn: false,
+        streakDays: 0, dailyCredit: 0, todayCredit: 0,
+      })
+      expect(identity).not.toHaveBeenCalled()
+    })
+
+    it('checkinStatus reports unavailable when the endpoint cannot be read', async () => {
+      const ctx = await setupScratch()
+      await writeGrant(ctx, grant())
+      const { session } = sessionStub()
+      const fetchSpy = vi.spyOn(checkin, 'fetchCheckinStatus').mockResolvedValue(undefined)
+      const svc = new CodeBuddyRemoteService(ctx, { session })
+
+      const status = await svc.checkinStatus()
+      expect(status.available).toBe(false)
+      expect(status.active).toBe(false)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('checkinStatus passes the read-through flags through', async () => {
+      const ctx = await setupScratch()
+      await writeGrant(ctx, grant())
+      const { session } = sessionStub()
+      vi.spyOn(checkin, 'fetchCheckinStatus').mockResolvedValue({
+        active: true, checkedIn: true, streakDays: 20, dailyCredit: 100, todayCredit: 100,
+      })
+      const svc = new CodeBuddyRemoteService(ctx, { session })
+
+      await expect(svc.checkinStatus()).resolves.toEqual({
+        available: true, active: true, checkedIn: true,
+        streakDays: 20, dailyCredit: 100, todayCredit: 100,
+      })
+    })
+
+    it('checkin returns the server outcome, including the reason on failure', async () => {
+      const ctx = await setupScratch()
+      await writeGrant(ctx, grant())
+      const { session } = sessionStub()
+      const fetchSpy = vi.spyOn(checkin, 'performCheckin').mockResolvedValue({
+        success: false, message: '活动未开启', credit: 0, streakDays: 0,
+      })
+      const svc = new CodeBuddyRemoteService(ctx, { session })
+
+      await expect(svc.checkin()).resolves.toEqual({
+        success: false, message: '活动未开启', credit: 0, streakDays: 0,
+      })
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('checkin reports a signed-out account as failed without calling the endpoint', async () => {
+      const ctx = await setupScratch()
+      const { session, identity } = sessionStub()
+      const fetchSpy = vi.spyOn(checkin, 'performCheckin')
+      const svc = new CodeBuddyRemoteService(ctx, { session })
+
+      const result = await svc.checkin()
+      expect(result.success).toBe(false)
+      expect(result.message).toBe('not signed in')
+      expect(identity).not.toHaveBeenCalled()
+      expect(fetchSpy).not.toHaveBeenCalled()
     })
   })
 

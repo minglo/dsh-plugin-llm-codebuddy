@@ -103,6 +103,42 @@ describe('莫兰迪调色板', () => {
     }
   })
 
+  it('签到填充色离所有既有色值可分辨，且仍是莫兰迪', () => {
+    // 圆心的填充色与三环、图例、状态徽标同屏，撞色会让人以为它表达的是别的东西。
+    // 与 {@link MORANDI.ok} 的灰豆绿刻意同族（「办成了」）但 ΔE≈18.5：是同一件事，
+    // 不是同一个徽标。
+    for (const [name, hex] of Object.entries(MORANDI)) {
+      if (name === 'checked') continue
+      const d = deltaE(MORANDI.checked, hex)
+      expect(d, `checked vs ${name} 只差 ${d.toFixed(1)}`).toBeGreaterThanOrEqual(11)
+    }
+    for (const day of EXPIRY_COLORS) {
+      const d = deltaE(MORANDI.checked, day)
+      expect(d, `checked vs 7天色阶 ${day} 只差 ${d.toFixed(1)}`).toBeGreaterThanOrEqual(11)
+    }
+    // 与 ok 的间距单独钉住：这是「同族但不同物」的量化含义。
+    expect(deltaE(MORANDI.checked, MORANDI.ok)).toBeGreaterThan(15)
+    const { s, l } = hsl(MORANDI.checked)
+    expect(s, `checked 饱和度 ${(s * 100).toFixed(0)}% 过高`).toBeLessThanOrEqual(0.32)
+    expect(l, `checked 明度 ${(l * 100).toFixed(0)}% 出界`).toBeGreaterThanOrEqual(0.45)
+    expect(l, `checked 明度 ${(l * 100).toFixed(0)}% 出界`).toBeLessThanOrEqual(0.80)
+  })
+
+  it('签到填充色上的深墨文字达到可读对比（深浅两套主题同一支笔）', () => {
+    // 填充是逐渐铺满的，中途背景半深半浅；深墨文字层被同一个遮罩剪裁，永远只落在
+    // 已铺满的区域上，所以只需保证「满色圆 vs 深墨」这一格够读。
+    const ink = [0x16, 0x20, 0x1b]
+    const bg = toRgb(MORANDI.checked).map(v => {
+      const c = v / 255
+      return c > 0.04045 ? ((c + 0.055) / 1.055) ** 2.4 : c / 12.92
+    })
+    const lum = (rgb: number[]): number => 0.2126 * rgb[0]! + 0.7152 * rgb[1]! + 0.0722 * rgb[2]!
+    const inkRgb = ink.map(v => { const c = v / 255; return c > 0.04045 ? ((c + 0.055) / 1.055) ** 2.4 : c / 12.92 })
+    const la = lum(bg), lb = lum(inkRgb)
+    const ratio = (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+    expect(ratio, `填充色上的深墨文字对比 ${ratio.toFixed(2)} 低于 4.5`).toBeGreaterThanOrEqual(4.5)
+  })
+
   it('到期三档是同族连续色阶：相邻比跨档更接近', () => {
     const [a, b, c] = SEGMENT_COLORS as unknown as [string, string, string]
     const adjacent = Math.min(deltaE(a, b), deltaE(b, c))

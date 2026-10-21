@@ -25,8 +25,8 @@ import { formatCredits, finiteOr } from './shared.js'
 import { MORANDI, monthColor } from './palette.js'
 import { daySegments, type DaySegment } from './usage-metrics.js'
 
-/** 画布边长；所有半径都相对它写死，缩放交给 CSS。 */
-const SIZE = 220
+/** 画布边长；所有半径都相对它写死，缩放交给 CSS。导出供测试断言几何常量。 */
+export const SIZE = 220
 const CENTER = SIZE / 2
 /** stroke 宽度。三环同宽，视觉重量一致。导出供测试量「圆头实际着色范围」。 */
 export const STROKE = 13
@@ -39,6 +39,28 @@ const TRACK_COLOR = 'var(--dsw-alias-border-l2)'
 const R_INNER = 54
 const R_MIDDLE = R_INNER + STROKE + RING_GAP
 const R_OUTER = R_MIDDLE + STROKE + RING_GAP
+
+/**
+ * 签到填充圆的半径：**第一环内缘再往内让出一个 RING_GAP**（47.5 − 8 = 39.5）。
+ *
+ * 让出这一个间隙是为了**与另外两环的间距一致**：中环与外环之间是 8px，
+ * 中心盘与第一环之间也该是 8px。此前中心盘半径取 47.5（恰好贴住内缘），
+ * 间距是 0——四层东西（中心盘 / 第一环 / 中环 / 外环）里只有这一处是
+ * 零间隙，看着就像中心盘属于环、而不属于中心。
+ *
+ * 同时也因此不会盖住第一环的描边带（47.5–60.5），「已用积分」那条弧完好。
+ */
+const R_CHECKIN = R_INNER - STROKE / 2 - RING_GAP
+
+/**
+ * 压在填充色上的深墨文字色。
+ *
+ * 写死而不用主题 token：填充是低明度灰绿（{@link MORANDI.checked}，明度 56%），
+ * 深墨在它上面是 4.77:1，深浅两套主题同一支笔都成立；而主题的
+ * `--dsw-alias-label-primary` 在深色主题下是浅灰、浅色主题下是深灰，两者只有
+ * 一种能在填充上读清。
+ */
+const CHECKED_INK = '#16201b'
 
 /** 生长动画时长，与下面的 CSS 保持一致。三环同一时长，一条曲线走到底。 */
 const ANIM_MS = 1000
@@ -68,12 +90,31 @@ const RINGS_CSS_TAG = 'dsh-plugin-llm-codebuddy/rings.module.css'
 const RINGS_CSS = `
 @keyframes cb-ring-grow{from{stroke-dashoffset:var(--cb-from)}to{stroke-dashoffset:var(--cb-to)}}
 @keyframes cb-ring-fade{from{opacity:0}to{opacity:1}}
+/* 签到填充：圆心从**中心**长出去，一直铺到第一环的内缘，与三环同一条曲线、同一时长。
+   遮罩里那颗白圆从 scale(0) 长到 scale(1)：它有多大，填充色与深墨文字就露多少。
+   播完时遮罩恰好全开；静态几何（不透明圆 + 满遮罩）始终在 DOM 里，reduced-motion 下
+   直接是满的，不依赖动画成立。 */
+@keyframes cb-checkin-fill{from{transform:scale(0)}to{transform:scale(1)}}
 @media (prefers-reduced-motion: no-preference){
   .cb-ring-arc{animation:cb-ring-grow ${ANIM_MS}ms cubic-bezier(.22,1,.36,1) backwards;
     transition:stroke-dashoffset 300ms ease}
   .cb-ring-static{transition:stroke-dashoffset 300ms ease,stroke-dasharray 300ms ease}
   .cb-ring-center{animation:cb-ring-fade 420ms ease-out 160ms backwards}
+  /* 与三环同时起手、同一时长、同一条缓动：读起来是一次动作，不是两段。
+     缩放的参照系写成 view-box + 绝对用户单位，而不是 fill-box/center：
+     fill-box 的参照框是元素自身的包围盒，SVG 元素的默认 transform-box 在
+     不同浏览器/版本间从 border-box 变到 view-box，绕原点缩放会让填充从
+     左上角长出来；view-box + 110px 110px 指向 viewBox 的正中，无歧义。 */
+  .cb-checkin-fill{animation:cb-checkin-fill ${ANIM_MS}ms cubic-bezier(.22,1,.36,1) backwards;
+    transform-box:view-box;transform-origin:${CENTER}px ${CENTER}px}
 }
+/* 签到按钮的伪类态（几何在内联样式里，见 s.checkinHit）。
+   悬停才出现的淡底是「这里可点」的提示：未签到时圆心是干净的（与签到态的
+   绿盘形成颜色区分），若常驻一个底色就分不清「未签到」与「可点」。
+   已签到/请求在飞时是 disabled，悬停不响应——点击也就不响应。 */
+.cb-checkin-hit:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.16))}
+.cb-checkin-hit:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.cb-checkin-hit:disabled{cursor:default}
 `
 
 function injectRingsCss(): void {
@@ -185,6 +226,31 @@ function formatDayLabel(t: (key: string) => string, segment: DaySegment): string
   return t('expiryDate').replace('{M}', String(segment.month)).replace('{D}', String(segment.dayOfMonth))
 }
 
+/**
+ * 圆心数值的字号：按字符数收窄，保证它**整体落在填充圆盘内**。
+ *
+ * 盘半径 39.5（直径 79），文字行所在高度上的弦长约 78.6px（行本身离圆心有偏移，
+ * 弦比直径略短）。20px 粗体下每位数字约 13.9px，于是：
+ *   ≤5 位（99999 → 69.6px）用 20px；
+ *   6 位（20px 下 83.5px，超出）→ 16px（66.8px）；
+ *   7 位 → 14px（68.2px）；
+ *   8–9 位 → 12px（66.8 / 71.4px）；
+ *   ≥10 位 → 11px（73.1px）。
+ *
+ * 收窄而不是截断：截断会让「1,234,567.89」变成「1,234,567.8」，读数直接是错的；
+ * 收窄后数字仍是完整的，只是小一号。
+ *
+ * @param text - 已格式化好的数值文本。
+ * @returns 字号（px）。
+ */
+export function centerValueFontSize(text: string): number {
+  if (text.length <= 5) return 20
+  if (text.length === 6) return 16
+  if (text.length === 7) return 14
+  if (text.length <= 9) return 12
+  return 11
+}
+
 const s = {
   // 允许换行：弹窗内容列放不下「220px 圆环 + 图例」时，图例会折到第二行，
   // 而不是把圆环挤扁。**是否居中由容器决定**（弹窗那条规则见 CodeBuddyTab 的
@@ -192,8 +258,35 @@ const s = {
   // 上下文脱节，所以组件本身默认左对齐。
   wrap: { display: 'flex', flexWrap: 'wrap' as const, alignItems: 'center', gap: '18px' },
   svg: { width: `${SIZE}px`, height: `${SIZE}px`, flexShrink: 0 },
+  // 圆环 + 签到按钮的共同容器：相对定位，按钮据此绝对定位到圆心。
+  svgWrap: { position: 'relative' as const, width: `${SIZE}px`, height: `${SIZE}px`, flexShrink: 0 },
+  /**
+   * 圆心的签到按钮：正好盖住填充圆盘（R_CHECKIN*2），浮在 SVG 之上。
+   *
+   * 几何写在**内联**样式里而不是样式表：这张表的注入发生在插件加载时，而圆环的
+   * 样式表是组件自己注入的（useEffect）——若几何也放在表里，首帧按钮会退回
+   * `position: static`，在容器里撑出一块 79px 的空白，把布局顶一下。悬停底色与
+   * 焦点环这类伪类留在表里（内联样式表达不了伪类）。
+   */
+  checkinHit: {
+    position: 'absolute' as const,
+    left: '50%',
+    top: '50%',
+    transform: 'translate(-50%, -50%)',
+    width: `${R_CHECKIN * 2}px`,
+    height: `${R_CHECKIN * 2}px`,
+    borderRadius: '50%',
+    border: 0,
+    padding: 0,
+    background: 'transparent',
+    cursor: 'pointer',
+  },
   centerLabel: { fontSize: '11px', fill: 'var(--dsw-alias-label-secondary)' },
   centerValue: { fontSize: '20px', fontWeight: 600, fill: 'var(--dsw-alias-label-primary)' },
+  // 已签到态的中心文字：与填充圆同一个深墨（4.77:1）。只被签到遮罩剪裁后渲染，
+  // 因此它永远落在已经铺满填充色的区域上——见 center 处的说明。
+  centerLabelInk: { fontSize: '11px', fill: CHECKED_INK },
+  centerValueInk: { fontSize: '20px', fontWeight: 600, fill: CHECKED_INK },
   // Grid 而不是若干个 flex 行：四列跨行共享，标签/数值/百分比各自成列对齐，
   // 且列宽只由内容决定（justifyContent: start），容器再宽也不会把标签与数值拉开。
   legend: {
@@ -310,15 +403,25 @@ function SweepHead({ radius, delayMs }: { radius: number; delayMs: number }): Re
  * 三环是同一种语法：**轨道静态、实心弧按进度长**。前两环的实心弧就是 {@link Arc} 自己
  * （dashoffset 从整圈长到终值）；外环的实心弧是 7 条彩色弧，被 {@link SweepHead} 的
  * 遮罩按 12 点起手的角度逐段揭开——动画只有一处，段的几何各自只有一份。
- * @param props - 读数与翻译函数。
+ * @param props - 读数、翻译函数、签到态与签到回调。
  */
-export function UsageRings({ view, t }: { view: UsageView; t: (key: string) => string }): ReactNode {
+export function UsageRings({ view, t, checked = false, onCheckin, checkinPending = false }: {
+  view: UsageView
+  t: (key: string) => string
+  /** 今日是否已签到：已签到时圆心铺填充色，且点击不再响应。 */
+  checked?: boolean
+  /** 点圆心签到。缺省 = 圆心不可点（纯展示）。 */
+  onCheckin?: () => void
+  /** 签到请求在飞：圆心不可再点（防双击发出两次写请求）。 */
+  checkinPending?: boolean
+}): ReactNode {
   useEffect(() => { injectRingsCss() }, [])
 
   // 同一页面上可能同时挂着插件卡片与弹窗两副圆环，遮罩 id 必须互不冲突。
   // useId 自带分隔符（React 18 是 `:r0:`），id 里不允许有标点，去掉。
   const uid = useId().replace(/[^a-zA-Z0-9]/g, '')
   const sweepMaskId = `cb-sweep-${uid}`
+  const checkinMaskId = `cb-checkin-${uid}`
 
   const totalBalance = finiteOr(view.totalBalance, 0)
   const totalSize = finiteOr(view.totalSize, 0)
@@ -331,20 +434,64 @@ export function UsageRings({ view, t }: { view: UsageView; t: (key: string) => s
   const segments = daySegments(view)
 
   // 中心文字用 SVG text 而不是 HTML 覆盖层：跟着 SVG 一起缩放，不会在窄容器里错位。
-  const center = h('g', { className: 'cb-ring-center' },
-    h('text', { x: CENTER, y: CENTER - 6, textAnchor: 'middle', style: s.centerLabel }, t('totalBalance')),
-    h('text', { x: CENTER, y: CENTER + 16, textAnchor: 'middle', style: s.centerValue }, formatCredits(totalBalance)),
+  //
+  // 已签到时分成**三层**，自下而上：
+  //   1. 主题色文字（.cb-ring-center）——签到前全程可见；
+  //   2. 绿色填充圆——被签到遮罩剪裁，圆盘从中心长到第一环内缘；
+  //   3. 深墨文字——**同一个遮罩**，所以只出现在已铺上填充色的区域。
+  //
+  // 为什么深墨字必须跟着遮罩走，而不能直接换色：填充是逐渐铺满的，中途背景
+  // 半深半浅，任何单一文字色都有一段时间读不清（实测深墨在 40% 铺度的深色卡片
+  // 上只有 1.8:1）。跟着遮罩走，深墨字出现的地方一定是已经铺满绿的地方，
+  // 对比度恒定 4.77:1；没铺到的地方仍是主题色字压在卡片底色上。
+  //
+  // 遮罩剪掉的主题色文字不会被绿色盖住——绿色在遮罩里，未铺到处根本不存在，
+  // 于是两层文字在任何一个像素上都不重叠，不会出现「重影」。
+  //
+  // **两行字都必须整体落在盘内**：标签用短措辞（totalBalanceShort），数值按
+  // 字符数收字号（centerValueFontSize）。否则标签会横跨盘边被切成两半颜色——
+  // 那正是英文完整措辞（126.7px）在 95px 盘上会出的事。
+  const balanceText = formatCredits(totalBalance)
+  const valueSize = centerValueFontSize(balanceText)
+  // 数值行随字号收窄时**基线也要跟着抬**：SVG 的 y 是基线，字号变小后同样的
+  // 基线会让这一行整体下坠、在盘里偏下。抬 (20 − size)/2 让两行在盘里居中。
+  const valueY = CENTER + 16 - (20 - valueSize) / 2
+  const center = h(Fragment, null,
+    h('g', { className: 'cb-ring-center' },
+      h('text', { x: CENTER, y: CENTER - 6, textAnchor: 'middle', style: s.centerLabel }, t('totalBalanceShort')),
+      h('text', { x: CENTER, y: valueY, textAnchor: 'middle', style: { ...s.centerValue, fontSize: `${valueSize}px` } }, balanceText),
+    ),
+    checked ? h('g', { mask: `url(#${checkinMaskId})`, 'data-checkin-layer': '' },
+      h('circle', {
+        'data-checkin-fill': '',
+        cx: CENTER,
+        cy: CENTER,
+        r: R_CHECKIN,
+        fill: MORANDI.checked,
+      }),
+      h('g', { 'data-checkin-ink': '' },
+        h('text', { x: CENTER, y: CENTER - 6, textAnchor: 'middle', style: s.centerLabelInk }, t('totalBalanceShort')),
+        h('text', { x: CENTER, y: valueY, textAnchor: 'middle', style: { ...s.centerValueInk, fontSize: `${valueSize}px` } }, balanceText),
+      ),
+    ) : null,
   )
 
   return h('div', { style: s.wrap, 'data-usage-rings': '' },
-    h('svg', {
-      viewBox: `0 0 ${SIZE} ${SIZE}`,
-      style: s.svg,
-      role: 'img',
-      // 读屏用户拿到的是一句话总结，而不是七段弧的几何。
-      'aria-label': `${t('totalBalance')} ${formatCredits(totalBalance)}`,
-    },
-      h('defs', null,
+    // 圆环本体 + 圆心的签到按钮，同在一个相对定位的盒子里。
+    //
+    // 按钮是 **HTML** 按钮而不是 SVG 里的 <g role="button">：SVG 的 role="img"
+    // 会让整棵子树对读屏软件变成装饰性的，里面的东西键盘到不了。而签到是一个
+    // 真按钮——要有焦点环、要有 aria-label、要在已签到时真的 disabled（而不是
+    // 「点了没反应」）。所以它浮在 SVG 之上。
+    h('div', { style: s.svgWrap },
+      h('svg', {
+        viewBox: `0 0 ${SIZE} ${SIZE}`,
+        style: s.svg,
+        role: 'img',
+        // 读屏用户拿到的是一句话总结，而不是七段弧的几何。
+        'aria-label': `${t('totalBalance')} ${formatCredits(totalBalance)}`,
+      },
+        h('defs', null,
         // 扫光遮罩：全黑为「还没变到」，白色弧扫到哪里就露出哪里。
         h('mask', {
           id: sweepMaskId,
@@ -354,7 +501,32 @@ export function UsageRings({ view, t }: { view: UsageView; t: (key: string) => s
           h('rect', { x: 0, y: 0, width: SIZE, height: SIZE, fill: '#000' }),
           h(SweepHead, { radius: R_OUTER, delayMs: OUTER_DELAY_MS }),
         ),
+        // 签到遮罩：与扫光同构，但剪的是「中心圆盘」而不是「外环弧」。白圆从
+        // scale(0) 长到 scale(1)，长到哪里，填充色与深墨字就露到哪里。
+        // 静态态（reduced-motion / jsdom）里白圆是满尺寸，遮罩全开 = 直接是满色。
+        checked ? h('mask', {
+          id: checkinMaskId,
+          maskUnits: 'userSpaceOnUse',
+          x: 0, y: 0, width: SIZE, height: SIZE,
+        },
+          h('rect', { x: 0, y: 0, width: SIZE, height: SIZE, fill: '#000' }),
+          h('circle', {
+            className: 'cb-checkin-fill',
+            cx: CENTER,
+            cy: CENTER,
+            r: R_CHECKIN,
+            fill: '#fff',
+          }),
+        ) : null,
       ),
+      // 中心组（主题色文字 + 签到填充层）排在**环之前**。
+      //
+      // 顺序不是审美问题而是正确性问题：填充圆的半径恰好等于第一环的内缘
+      // （47.5），两者相切。填充若画在环之后，相切处两条抗锯齿边会互相混色，
+      // 缝里出现一道脏边；画在环之前则由环的描边压住接缝，接缝干净。
+      //
+      // 文字不受影响：中心文字最宽约 55px（半径 27.5），远在第一环内缘之内。
+      center,
       // 内环：已用积分。灰紫——整体消耗是独立维度，与到期色阶不共色。
       h(Track, { radius: R_INNER }),
       totalRatio > 0 ? h(Arc, {
@@ -374,12 +546,32 @@ export function UsageRings({ view, t }: { view: UsageView; t: (key: string) => s
         cap: 'round',
         delayMs: MIDDLE_DELAY_MS,
       }) : null,
-      // 外环：未来 7 天分段。中性轨全程可见；只有已用的彩色弧被扫光遮罩逐段揭开。
-      h(DayTrack, { segments }),
-      h('g', { mask: `url(#${sweepMaskId})` }, h(DayProgress, { segments })),
-      center,
+        // 外环：未来 7 天分段。中性轨全程可见；只有已用的彩色弧被扫光遮罩逐段揭开。
+        h(DayTrack, { segments }),
+        h('g', { mask: `url(#${sweepMaskId})` }, h(DayProgress, { segments })),
+      ),
+      // 圆心的签到按钮。浮在 SVG 之上、正好盖住填充圆盘。
+      //
+      // 已签到 → disabled：点击**真的不响应**（不是「点了没反应」的假按钮）。
+      // 请求在飞 → 也 disabled：否则双击会发出两次写请求。
+      onCheckin === undefined ? null : h('button', {
+        type: 'button',
+        className: 'cb-checkin-hit',
+        style: s.checkinHit,
+        disabled: checked || checkinPending,
+        'aria-label': checkinPending
+          ? t('checkinPending')
+          : checked ? t('checkinDone') : t('checkinCta'),
+        title: checkinPending
+          ? t('checkinPending')
+          : checked ? t('checkinDone') : t('checkinCta'),
+        onClick: () => {
+          if (checked || checkinPending) return
+          onCheckin()
+        },
+      }),
     ),
-    h('div', { style: s.legend },
+    h('div', { style: s.legend, 'data-usage-legend': '' },
       h(LegendRow, {
         color: MORANDI.used,
         label: t('totalUsed'),
