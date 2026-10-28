@@ -3,7 +3,8 @@ import type { ReactNode } from 'react'
 import { Button, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { CheckinResultView, CheckinStatusView, LoginPoll, LoginStart, SearchBackendState, SettingsView, StatusView, UsageResult, UsageView } from '../remote-types.js'
+import type { ChannelHealthView, ChannelVerdict, CheckinResultView, CheckinStatusView, LoginPoll, LoginStart, ProbeResultView, SearchBackendState, SettingsView, StatusView, UsageResult, UsageView } from '../remote-types.js'
+import type { LocaleKey } from './locales.js'
 import { finiteOr, unwrap, withTimeout } from './shared.js'
 import { MORANDI } from './palette.js'
 import { UsageRings } from './UsageRings.jsx'
@@ -13,6 +14,15 @@ import { LOGIN_TIMEOUT_MS } from '../constants.js'
 
 /** 配置卡片单次远程读取的硬超时：host 挂住时不能让卡片永远停在加载态。 */
 const READ_TIMEOUT_MS = 15_000
+
+/**
+ * 自检调用的等待上限。
+ *
+ * 不能用 READ_TIMEOUT_MS：宿主侧三发各有 15 秒预算（PROBE_TIMEOUT_MS），最坏要
+ * 45 秒。按 15 秒收尾会让按钮在宿主仍在跑时重新可点，用户以为「这次没反应」，
+ * 而宿主只会把新点击并进同一个 in-flight Promise。留出 5 秒余量覆盖传输与排队。
+ */
+const PROBE_WAIT_MS = 50_000
 
 export interface CodeBuddyTabInjected {
   remote: {
@@ -26,6 +36,15 @@ export interface CodeBuddyTabInjected {
     checkinStatus(): Promise<RemoteResult<CheckinStatusView>>
     /** 执行今日签到。 */
     checkin(): Promise<RemoteResult<CheckinResultView>>
+    /**
+     * 渠道自检的历史读数（宿主只读盘、零外呼）。
+     *
+     * 手写结构声明，**不会**随 `client/index.ts` 的 `CodeBuddyRemote` 自动扩张：
+     * 那个接口描述的是网关的静态面，这里是卡片实际调用到的子集，两处都必须写。
+     */
+    channelHealth(): Promise<RemoteResult<ChannelHealthView>>
+    /** 跑一次三发自检。点按钮才调；宿主另外单飞，两重保险。 */
+    probe(): Promise<RemoteResult<ProbeResultView>>
   }
   setShowUsage(showUsage: boolean): Promise<void>
   /** 输入框工具行里的额度胶囊开关。 */
@@ -65,6 +84,17 @@ const CARD_CSS = `
    本卡片的容器不是官方设置文档，继承色不保证一致。 */
 .cb-setting-title{font-size:14px;line-height:20px;color:var(--dsw-alias-label-primary)}
 .cb-setting-desc{color:var(--dsw-alias-label-secondary);margin-top:4px;font-size:12px;line-height:18px}
+
+/* 自检行：**独立容器**，刻意不塞进 .cb-setting-group。它右侧是按钮不是开关，
+   而且组内行数被既有测试逐条量过（.cb-setting-row 与 button[role=switch] 的计数），
+   混进去会让「开关组的形状」这条断言失去意义。独立成块后，行自带的
+   下分隔线正好把它与下方的历史读数分开。 */
+.cb-probe{display:flex;flex-direction:column}
+.cb-probe-history{display:flex;flex-direction:column;gap:6px;padding:12px 0 0}
+.cb-probe-line{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+/* 时刻用等宽数字：两行读数上下对齐，扫一眼就不会把日期与分钟读串。 */
+.cb-probe-time{font-variant-numeric:tabular-nums;white-space:nowrap}
+.cb-probe-error{margin:0;font-size:12px;line-height:18px;color:${MORANDI.urgent}}
 
 /* 输入框胶囊的触发按钮。悬停底色只能用真 CSS：inline style 无法表达 :hover，
    而且 inline 的 background 会盖过任何样式表规则（特异性最高的那一种）。
@@ -188,6 +218,140 @@ function searchBadge(state: SearchBackendState, t: Translate): ReactNode {
   )
 }
 
+/**
+ * verdict → 文案键。机械映射，避免调用点临时起名导致两种说法并存。
+ *
+ * 键是 `ChannelVerdict`，但查表时按 `string` 取。**版本偏斜到不了这里**：wire 上的
+ * verdict 由 descriptor 的 `z.enum` 先行校验，未知值会让整次 `probe()` 调用失败，
+ * 客户端看到的是 `probeFailed`（未完成），不是 `probeUnknown`。下面的兜底仍然保留，
+ * 用来防御绕过 wire 校验的调用（测试替身、直接复用组件的组合代码），绝不让键名或
+ * 英文枚举上屏。
+ */
+const PROBE_KEY: Record<ChannelVerdict, LocaleKey> = {
+  'healthy': 'probeHealthy',
+  'rule-gone': 'probeRuleGone',
+  'neutralization-broken': 'probeBroken',
+  'inconsistent': 'probeInconsistent',
+  'stage-failed': 'probeStageFailed',
+  'channel-rejected': 'probeRejected',
+  'auth': 'probeAuth',
+  'rate-limited': 'probeRateLimited',
+  'quota': 'probeQuota',
+  'unavailable': 'probeUnavailable',
+  'unreachable': 'probeUnreachable',
+}
+
+/**
+ * verdict → 徽标圆点色。全部取自既有调色板（palette.test.ts 用 ΔE 锁死了色值，
+ * 新增一个色要过同一套校验，收益不值）。
+ *
+ * 读法是「用户该做什么」，不是「严重程度」：
+ *   · ok         —— 什么都不用做（规则在、中和有效）；
+ *   · neutral    —— 没有可行动项（规则已消失、上游未分类失败、连不上——都是等或不管）；
+ *   · urgent     —— 需要动手（中和失效＝该更新插件；渠道拒收＝请求头不合规）；
+ *   · blocked    —— 先解决前置条件再谈渠道（凭据失效、限流、额度用尽）；
+ *   · warn       —— 证据不足以下结论（自相矛盾、自检没跑完），别照着做决定。
+ */
+const PROBE_COLOR: Record<ChannelVerdict, string> = {
+  'healthy': MORANDI.ok,
+  'rule-gone': MORANDI.neutral,
+  'neutralization-broken': MORANDI.urgent,
+  'inconsistent': MORANDI.warn,
+  'stage-failed': MORANDI.warn,
+  'channel-rejected': MORANDI.urgent,
+  'auth': MORANDI.blocked,
+  'rate-limited': MORANDI.blocked,
+  'quota': MORANDI.blocked,
+  'unavailable': MORANDI.neutral,
+  'unreachable': MORANDI.neutral,
+}
+
+/** 未知 verdict 的兜底色：不表态的暖灰。 */
+const PROBE_COLOR_UNKNOWN = MORANDI.neutral
+
+/**
+ * 查表按字符串取，但只认**自有键**。
+ *
+ * 不能写 `table[verdict] ?? fallback`：`toString` / `__proto__` 这类名字在普通对象
+ * 上会取到原型链成员，返回值是 truthy 的函数或对象，`??` 根本不会兜底——那个函数
+ * 会被当成 LocaleKey 交给 `t()`，最终以「函数不能作为 React 子节点」收场。
+ */
+function probeKeyOf(verdict: string): LocaleKey {
+  return Object.hasOwn(PROBE_KEY, verdict)
+    ? PROBE_KEY[verdict as ChannelVerdict]
+    : 'probeUnknown'
+}
+
+function probeColorOf(verdict: string): string {
+  return (PROBE_COLOR as Record<string, string | undefined>)[verdict] ?? PROBE_COLOR_UNKNOWN
+}
+
+/**
+ * `fingerprintGuess` → 文案键。
+ *
+ * 闭集只有三个取值；读的是 wire 上的字符串，仍按 string 查表兜底——旧客户端
+ * 遇到新主机下发的新取值时，宁可说「未能定位」，也不把标识符原样打上屏。
+ */
+const FINGERPRINT_KEY: Record<'identity-sentence' | 'anywhere' | 'unknown', LocaleKey> = {
+  'identity-sentence': 'probeFingerprintIdentity',
+  'anywhere': 'probeFingerprintAnywhere',
+  'unknown': 'probeFingerprintUnknown',
+}
+
+/** 指纹位置的可读文案。 */
+function fingerprintText(guess: string, t: Translate): string {
+  // `Object.hasOwn` 而不是裸查表：`'toString'` 这类名字会从原型上取到函数，
+  // `??` 拦不住，而那正是「未知取值」最可能的样子。
+  return t(Object.hasOwn(FINGERPRINT_KEY, guess)
+    ? FINGERPRINT_KEY[guess as keyof typeof FINGERPRINT_KEY]
+    : 'probeFingerprintUnknown')
+}
+
+/**
+ * 判定句。`stage-failed` 的原文带 `{stage}` / `{status}` 占位符：设计文档要求
+ * 逐字，所以这里用探针实测的那一阶段去填，而不是把占位符原样上屏或丢掉证据。
+ * 找不到非 200 阶段（理论上不会发生）时用破折号占位，读数仍读得通。
+ */
+function probeSentence(result: ProbeResultView, t: Translate): string {
+  const key = probeKeyOf(result.verdict)
+  const text = t(key)
+  if (key !== 'probeStageFailed') return text
+  const failed = result.stages.find(stage => stage.status !== undefined && stage.status !== 200)
+  return text
+    .replace('{stage}', failed?.stage ?? '—')
+    .replace('{status}', failed?.status === undefined ? '—' : String(failed.status))
+}
+
+/** 固定 `YYYY-MM-DD HH:mm`，不随运行环境 locale 变（同 ComposerUsage 的理由）。 */
+function probeTime(ms: number): string {
+  const d = new Date(ms)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/**
+ * 自检结论徽标：结构与 `searchBadge` 同构（圆点承载状态色 + 文字保持中性），
+ * 但**允许换行**——判定句是完整一句话，窄卡片里 nowrap 会把它挤出可视区。
+ */
+function probeBadge(result: ProbeResultView, t: Translate): ReactNode {
+  // flexShrink:1 + 可换行：判定句比卡片宽时折成两三行，而不是把按钮挤出可视区。
+  // 不带类名：这里所有样式都在内联 style 里，加一个没有规则的类只会让后来者
+  // 误以为 CSS 里有它的定义（`.cb-badge` 是例外——测试靠它定位搜索徽标）。
+  return h('span', { style: { ...s.badge, whiteSpace: 'normal' as const, flexShrink: 1 } },
+    h('span', { style: { ...s.badgeDot, background: probeColorOf(result.verdict) } }),
+    probeSentence(result, t),
+  )
+}
+
+/** 一行历史读数：「标签 时刻/兜底 [+ 徽标]」。 */
+function probeLine(label: string, at: number | undefined, rest?: ReactNode): ReactNode {
+  return h('div', { className: 'cb-probe-line' },
+    h('span', null, label),
+    at !== undefined ? h('span', { className: 'cb-probe-time' }, probeTime(at)) : null,
+    rest ?? null,
+  )
+}
+
 export function CodeBuddyTab(props: Props): ReactNode {
   // `plugins.bundle.config` 只渲染 `page` 视图（契约原文：`view: 'page'` only），
   // 卡片标题/简介由 Plugins 页按包的 locale 元数据绘制，故这里不再有 summary 分支。
@@ -218,7 +382,23 @@ function CodeBuddyTabBody({ remote, setShowUsage, setShowComposerUsage, setWaitO
   const [waitOnRateLimitPref, setWaitOnRateLimitPref] = useState<boolean>(false)
   const [webSearchPref, setWebSearchPref] = useState<boolean>(false)
   const [searchBackend, setSearchBackend] = useState<SearchBackendState | undefined>(undefined)
+  // 自检读数：`health` 是首屏从盘里读到的历史（含上次真实拦截），`probeResult`
+  // 优先显示本次或历史（`lastProbe`）里的最近一次结论。
+  const [health, setHealth] = useState<ChannelHealthView | undefined>(undefined)
+  const [probeResult, setProbeResult] = useState<ProbeResultView | undefined>(undefined)
+  const [probing, setProbing] = useState<boolean>(false)
+  const [probeFailed, setProbeFailed] = useState<boolean>(false)
   const starting = useRef(false)
+  /** 自检在飞。state 用于渲染，ref 用于拦同一 tick 内的第二次点击。 */
+  const probingRef = useRef(false)
+  /**
+   * 组件是否仍挂载。
+   *
+   * runProbe 的 await 最长 50 秒（PROBE_WAIT_MS），用户完全可能在这期间关掉设置页。
+   * 卸载后再 setState 是 React 不会替我们挡的泄漏；channelHealth 的读取用局部
+   * `stopped` 旗标挡住了同一类问题，这里的窗口长得多，不能只靠「反正很快就回来」。
+   */
+  const mounted = useRef(true)
 
   const refresh = useCallback(async () => {
     try {
@@ -238,6 +418,27 @@ function CodeBuddyTabBody({ remote, setShowUsage, setShowComposerUsage, setWaitO
   }, [remote, t])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  // 渠道自检的历史读数。`channelHealth()` 只读落盘文件、零外呼——首屏因此可以放心
+  // 调它，而 `probe()`（会打三发、消耗额度）只挂在按钮上，见 runProbe。
+  //
+  // 读不到时整行不出现，而不是报错：旧 host 没有这个方法（浏览器产物可单独替换）、
+  // 文件损坏、超时，都只丢「上次结论」这一块读数，诊断失败不能连累整张卡片。
+  useEffect(() => {
+    let stopped = false
+    void (async () => {
+      try {
+        const view = await withTimeout(unwrap(remote.channelHealth()), READ_TIMEOUT_MS)
+        if (stopped) return
+        setHealth(view)
+        // 历史结论先上屏：用户点按钮之前看到的就是上一次跑出来的那一句。
+        if (view.lastProbe !== undefined) setProbeResult(view.lastProbe)
+      } catch {
+        if (!stopped) setHealth(undefined)
+      }
+    })()
+    return () => { stopped = true }
+  }, [remote])
 
   // 签到：圆心可点。成功后重取读数（签到加了积分，额度变了）。
   const checkin = useCheckin(remote, t, { onSuccess: refresh })
@@ -348,6 +549,33 @@ function CodeBuddyTabBody({ remote, setShowUsage, setShowComposerUsage, setWaitO
     }
   }, [setWebSearch, refresh, t])
 
+  /**
+   * 跑一次自检。**只有这里会调 `probe()`**——挂载路径不许外呼（规格 §2）。
+   *
+   * 双重防重：`probingRef` 拦住同一帧里的第二次点击（state 尚未提交），`probing`
+   * 负责按钮的 disabled。宿主自己也会单飞，但 UI 不能靠「反正宿主会并」来表现成
+   * 点了没反应——重复点击期间按钮就该是禁用的。
+   */
+  const runProbe = useCallback(async () => {
+    if (probingRef.current) return
+    probingRef.current = true
+    setProbing(true)
+    setProbeFailed(false)
+    try {
+      const result = await withTimeout(unwrap(remote.probe()), PROBE_WAIT_MS)
+      // 已卸载就只丢结果：ref 仍要复位（下面 finally），但不能再碰 React 状态。
+      if (!mounted.current) return
+      setProbeResult(result)
+    } catch {
+      // 调用本身失败（宿主拒绝、会话已释放）不产生 verdict：说「没启动」，
+      // 而不是编一个结论。上一次的读数保持原样——它确实是「上次」发生的事。
+      if (mounted.current) setProbeFailed(true)
+    } finally {
+      probingRef.current = false
+      if (mounted.current) setProbing(false)
+    }
+  }, [remote])
+
   const logout = useCallback(async () => {
     try {
       await unwrap(remote.logout())
@@ -361,6 +589,13 @@ function CodeBuddyTabBody({ remote, setShowUsage, setShowComposerUsage, setWaitO
   }, [remote, t])
 
   useEffect(() => { injectCardCss() }, [])
+
+  // 严格模式下 effect 会 mount → unmount → mount：重新挂载时必须把旗标复位，
+  // 否则第二次挂载后的探针结果会被当成「已卸载」丢掉。
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
   const signedIn = status?.loggedIn === true
 
@@ -416,6 +651,47 @@ function CodeBuddyTabBody({ remote, setShowUsage, setShowComposerUsage, setWaitO
     searchBackend !== undefined ? searchBadge(searchBackend, t) : undefined,
   )
 
+  // 自检行：只在已登录、且本部署真的跑渠道校验时出现。自建网关没有渠道校验，
+  // 三发探针会恒报 `rule-gone`——那是误导性建议，整行藏掉比给个假结论好。
+  const probeRow = signedIn && health?.applicable === true
+    ? h('div', { className: 'cb-probe' },
+        h('div', { className: 'cb-setting-row' },
+          h('div', null,
+            h('div', { className: 'cb-setting-head' },
+              h('span', { className: 'cb-setting-title' }, t('probeTitle')),
+            ),
+            h('div', { className: 'cb-setting-desc' }, t('probeDesc')),
+          ),
+          h(Button, {
+            variant: 'outline',
+            size: 'md',
+            disabled: probing,
+            onClick: () => { void runProbe() },
+          }, probing ? t('probeRunning') : t('probeRun')),
+        ),
+        h('div', { className: 'cb-probe-history' },
+          probeFailed ? h('p', { className: 'cb-probe-error' }, t('probeFailed')) : null,
+          // 上次自检：没有结论时也要有这一行——「从没跑过」本身是读数，
+          // 空着会让人以为这一块没渲染出来。
+          probeLine(
+            t('probeLastRun'),
+            probeResult?.at,
+            probeResult !== undefined ? probeBadge(probeResult, t) : h('span', null, t('probeNever')),
+          ),
+          // 上次真实拦截由被动分类写入，与探针结果无关：自检自己的 11128 不写这里，
+          // 所以这条读数永远是「真实请求」的现场。指纹猜测紧跟在时刻后面：
+          // 「何时开始拦」与「拦的是哪种形状」是报障时仅有的两条线索。
+          probeLine(
+            t('probeLastBlock'),
+            health.lastBlock?.at,
+            health.lastBlock === undefined
+              ? h('span', null, t('probeNever'))
+              : h('span', null, fingerprintText(health.lastBlock.fingerprintGuess, t)),
+          ),
+        ),
+      )
+    : null
+
   const body = phase === 'loading'
     ? h('div', { style: s.section }, h('p', { style: s.muted }, t('loading')))
     : h('div', { style: s.section },
@@ -451,6 +727,8 @@ function CodeBuddyTabBody({ remote, setShowUsage, setShowComposerUsage, setWaitO
           // 搜索接管开关只在已登录时出现（见 webSearchRow 的说明）。
           signedIn ? webSearchRow : null,
         ),
+        // 自检行在开关组之外：它是「按钮 + 历史读数」，不是开关行。
+        probeRow,
       )
 
   // 失败提示条浮在页面顶端（Toast 自己走 portal），与正文并列渲染。

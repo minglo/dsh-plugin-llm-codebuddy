@@ -1,28 +1,51 @@
 import { Context, Service } from '@deepseek-ai/cordis'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LocalCredentialProvider } from '@deepseek-ai/dsh-credentials-local'
 import { WebRuntime } from '@deepseek-ai/dsh-web'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../src/index.js'
 import { writeGrant } from '../src/auth.js'
 import type { CodeBuddyGrant } from '../src/auth.js'
+import { CODEBUDDY_CHAT_BASE } from '../src/constants.js'
+import type { ChannelBlockRecord } from '../src/remote-types.js'
 import { SETTINGS_NS } from '../src/settings-ns.js'
+import { gatewayRootOf } from '../src/web-sync.js'
 
 const scratchDirs: string[] = []
 
 afterEach(() => {
+  vi.unstubAllEnvs()
   for (const dir of scratchDirs.splice(0)) {
     try { rmSync(dir, { recursive: true, force: true }) } catch { /* best-effort cleanup */ }
   }
 })
 
-/** llm seam 的最小替身：apply() 需要 registerAdapter。 */
+/**
+ * llm seam 的最小替身：apply() 需要 registerAdapter。
+ *
+ * 顺手留下链路里的 adapter：探针的 chat base 与拦截记录出口都是 apply() 传给它的
+ * 构造选项，只有从这里才能观察「组合层实际接了什么」，而不是只测到服务能跑。
+ */
 class FakeLlm extends Service {
   static inject: string[] = []
+  readonly adapters: unknown[] = []
   constructor(ctx: Context) { super(ctx, 'llm') }
-  registerAdapter(): () => void { return () => {} }
+  registerAdapter(_providers: readonly string[], adapter: unknown): () => void {
+    this.adapters.push(adapter)
+    return () => {}
+  }
+}
+
+/** 取 apply() 注册进 llm seam 的那个 adapter（测试单例，每个 ctx 只有一个）。 */
+function registeredAdapter(ctx: Context): {
+  config: { recordBlock?: (record: ChannelBlockRecord) => void }
+} {
+  const llm = ctx.get('llm') as unknown as FakeLlm
+  const adapter = llm.adapters[0]
+  if (adapter === undefined) throw new Error('apply() did not register an adapter')
+  return adapter as { config: { recordBlock?: (record: ChannelBlockRecord) => void } }
 }
 
 /**
@@ -335,6 +358,69 @@ describe('apply() · self-heals after a late login state', () => {
 
     expect(await backendOf(ctx)).toBe('codebuddy')
     expect(searchPin(composed)).toBe('codebuddy')
+  })
+})
+
+/**
+ * T6-A 回归：探针与渠道指纹判定走的必须是**聊天面**地址。
+ *
+ * 把 `chatBaseURL: () => resolved.baseURL` 错接成 `() => gatewayRootOf(resolved.baseURL)`
+ * 时，applicable 仍为 true（前缀判定两者都算官方站点），既有 probe 用例又都绕开
+ * fetch，所以整个套件照绿——必须在接线处直接钉住实际注入的选项。
+ */
+describe('apply() · channel probe chat base', () => {
+  it('injects the chat base (with /v2), not the gateway root', async () => {
+    const { ctx, config } = await compose({ loggedIn: true, webSearch: false })
+    apply(ctx, config as never)
+
+    // `options` 在 TS 里是 private，运行时只是普通字段。这里要断言的就是
+    // 「apply 实际传给服务的值」，读私有字段比从外部复算一遍更接近事实。
+    const remote = ctx.get('codebuddy') as unknown as {
+      options: { chatBaseURL?: () => string }
+    }
+    const chatBase = remote.options.chatBaseURL?.()
+
+    expect(chatBase).toBe(CODEBUDDY_CHAT_BASE)
+    expect(chatBase?.endsWith('/v2')).toBe(true)
+    // 同一地址经 gatewayRootOf 会剥掉 /v2：这一条把「错接成网关根」与
+    // 「默认值恰好也是 /v2」区分开。
+    expect(chatBase).not.toBe(gatewayRootOf(chatBase ?? ''))
+  })
+})
+
+/**
+ * T6-B 回归：`recordBlock` 是诊断旁路，写盘失败只能记日志。
+ *
+ * 生产路径（真实请求撞 11128）要跑完整个适配器，成本远高于这条旁路的价值；
+ * 这里直接取出 apply() 注入给 adapter 的回调，用一份必然失败的落盘环境调用它。
+ * 回调同步返回（adapter 的 try/catch 不会被触发），异步拒绝由 index.ts 的
+ * `.catch` 收走并写日志。
+ */
+describe('apply() · channel block recording is best-effort', () => {
+  it('logs a failed write without making the callback throw', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cb-record-fail-'))
+    scratchDirs.push(dir)
+    // DSH_HOME 指向一个普通文件：mkdir(recursive) 必然失败，recordChannelBlock 拒绝。
+    const blockedHome = join(dir, 'not-a-directory')
+    writeFileSync(blockedHome, 'x')
+    vi.stubEnv('DSH_HOME', blockedHome)
+
+    const composed = await compose({ loggedIn: true, webSearch: false })
+    const warn = vi.spyOn(composed.ctx.logger, 'warn').mockImplementation(() => {})
+    apply(composed.ctx, composed.config as never)
+
+    const recordBlock = registeredAdapter(composed.ctx).config.recordBlock
+    expect(recordBlock).toBeDefined()
+    expect(() => recordBlock?.({
+      at: Date.now(),
+      endpoint: CODEBUDDY_CHAT_BASE,
+      systemLength: 10,
+      fingerprintGuess: 'identity-sentence',
+    })).not.toThrow()
+
+    // 让 `.catch` 在微任务/宏任务里落地，再断言旁路失败确实被记了一行。
+    await settle()
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('recording a channel block failed'))
   })
 })
 

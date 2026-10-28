@@ -72,3 +72,27 @@ jobs:
           fi
 
           echo "产物核对通过：$(wc -l < "$RUNNER_TEMP/listing.txt") 个条目"
+
+  # 上面那道只在 Linux 上跑：路径分隔符、BOM 容忍、锁的 rename 重试与权限语义
+  # 在 Windows/macOS 上都没有人看过。这里只跑 typecheck + 测试，不重复构建；
+  # node 也只测 22（engines 的下界）——两个平台的差异与 node 版本无关，铺开矩阵
+  # 只是多烧一遍 runner。pack smoke 用 tar/grep，留在 ubuntu job 里，这里不换 shell。
+  verify-cross-platform:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm test

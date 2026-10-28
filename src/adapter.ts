@@ -1,13 +1,15 @@
 import {
-  attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, isQuotaExceededError,
+  CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, isQuotaExceededError,
   LlmAdapter, LlmError, ProviderRequestId, QUOTA_EXCEEDED_CODE, ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, ResolvedRetryPolicy, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { deadline, idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
-import { CODEBUDDY_DISPLAY_NAME, CODEBUDDY_PRODUCT, CODEBUDDY_REPO_URL, PACKAGE_NAME, RATE_LIMIT_WAIT_CAP_MS, REQUEST_TIMEOUT_MS } from './constants.js'
-import { isCodeBuddyEndpoint } from './channel-fingerprint.js'
+import { CHANNEL_REJECTION_CODE, CODEBUDDY_DISPLAY_NAME, PACKAGE_NAME, RATE_LIMIT_WAIT_CAP_MS, REQUEST_TIMEOUT_MS, TRANSIENT_UPSTREAM_CODE } from './constants.js'
+import { buildChatHeaders } from './chat-headers.js'
+import { guessFingerprint, isCodeBuddyEndpoint } from './channel-fingerprint.js'
 import { curatedSentence, firstText, joinedMessage, wordingKeys } from './failure-message.js'
-import { serializeRequest } from './serialize.js'
+import type { ChannelBlockRecord } from './remote-types.js'
+import { flattenText, serializeRequest } from './serialize.js'
 import { NotLoggedInError, SessionUnavailableError } from './session.js'
 import type { CodeBuddySession } from './session.js'
 import { resetAtFromText } from './reset-time.js'
@@ -50,11 +52,16 @@ export interface CodeBuddyAdapterOptions {
    * 那条日志留下服务当时到底发了什么，下次就能照实核对，而不必再猜。
    */
   warn?: (message: string) => void
+  /**
+   * 真实请求被渠道校验拒收（11128）时的现场记录出口。
+   *
+   * **注入的回调，不是 import**：`adapter` 不碰 fs，也不与 `channel-health` 成环
+   *（那个模块将来要读这里的类型，适配器只依赖类型、不依赖实现）。副作用失败只
+   * warn，绝不改变请求结果。
+   */
+  recordBlock?: (record: ChannelBlockRecord) => void
 }
 
-import { createRequire } from 'node:module'
-const { version } = createRequire(import.meta.url)('../package.json') as { version: string }
-const APP_IDENTITY = { product: CODEBUDDY_PRODUCT, version, url: CODEBUDDY_REPO_URL }
 const CONNECT_TIMEOUT_CODE = 'LLM_CONNECT_TIMEOUT'
 const STREAM_IDLE_TIMEOUT_CODE = 'LLM_STREAM_IDLE_TIMEOUT'
 
@@ -112,14 +119,6 @@ function bodyForLog(body: string | undefined): string {
   if (body === undefined) return '<unreadable body>'
   return body.length <= 512 ? body : `${body.slice(0, 512)}…`
 }
-
-/**
- * 上游把厂商侧的瞬时校验失败包装成 HTTP 400 抛回来的那一种 code。
- *
- * 那是服务端故障窗口，同构请求稍后重发即成功。宿主只重试 RATE_LIMIT/SERVER/
- * TIMEOUT/TRANSPORT，400 一律不重试——所以这个码得由插件自己认。
- */
-const TRANSIENT_UPSTREAM_CODE = 11133
 
 /** 瞬时 400 的退避重发间隔；用完最后一次就放弃，把失败原样抛给宿主。 */
 const TRANSIENT_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000, 10_000, 25_000]
@@ -368,17 +367,10 @@ export class CodeBuddyAdapter extends LlmAdapter {
     } catch (error) {
       throwMissingCredential(error)
     }
-    // X-Conversation-ID 供服务端做亲和路由与 prefix-cache 复用：盖上宿主每会话 id，
-    // 让同一会话的每一轮都落在同一条路由上（opencode 同款插件亦发此头）。
-    // X-Model-ID 显式声明本次路由到的模型，便于服务端按模型分账与限流。
-    const headers = {
-      ...authHeaders,
-      'content-type': 'application/json',
-      'accept': 'text/event-stream',
-      ...attributionHeaders(APP_IDENTITY),
-      ...options.sessionId === undefined ? {} : { 'X-Conversation-ID': options.sessionId },
-      'X-Model-ID': options.model,
-    }
+    const headers = buildChatHeaders(authHeaders, {
+      model: options.model,
+      ...options.sessionId === undefined ? {} : { sessionId: options.sessionId },
+    })
     const models = await this.config.session.models(options.signal)
     const entry = models.find(candidate => candidate.id === options.model)
     const supportsImages = entry?.supportsImages === true
@@ -387,7 +379,19 @@ export class CodeBuddyAdapter extends LlmAdapter {
     }
     // 渠道校验的身份指纹只在 CodeBuddy 官方端点上生效：自建网关/代理没有那道
     // 校验，它们的运营方应该看到 dsh 真正组装的提示，所以那里不改写。
-    const body = JSON.stringify(serializeRequest(options, supportsImages, isCodeBuddyEndpoint(connection.baseURL)))
+    const request = serializeRequest(options, supportsImages, isCodeBuddyEndpoint(connection.baseURL))
+    const payload = JSON.stringify(request)
+    // 判定指纹看宿主交来的原文，不看发出去的那一份：改写后开头整句指纹必然不再
+    // 命中，按它判定永远是 `unknown`，这个字段就成了常量、失去诊断价值。
+    //
+    // 原文有两条来路（dsh-llm 的 GenerateOptions 契约）：一次性调用放在
+    // `options.system`；真实对话由 loop 组装，那句提示是 messages 开头的一条
+    // system 消息、`options.system` 反而缺省。只读前者的话，最需要证据的真实
+    // 对话上 systemLength 恒 0、指纹恒 `unknown`。
+    const systemText = options.system ?? options.messages
+      .filter(message => message.role === 'system')
+      .map(message => flattenText(message.content))
+      .join('\n')
     // 连接死线只护「建立连接 + 等响应头」这一阶段；响应体是长生命 SSE，由下面的
     // idleWatchdog 管，绝不能让一个总时长窗口在模型推理中途 abort 掉 body。
     let response!: Response
@@ -396,7 +400,7 @@ export class CodeBuddyAdapter extends LlmAdapter {
       const connect = deadline(options.signal, REQUEST_TIMEOUT_MS, CONNECT_TIMEOUT_CODE)
       try {
         response = await fetch(`${connection.baseURL}/chat/completions`, {
-          method: 'POST', headers, body, signal: connect.signal,
+          method: 'POST', headers, body: payload, signal: connect.signal,
         })
       } catch (error: unknown) {
         // 先认自己的死线：timeoutOf 只匹配本 code，caller 自己的超时不会被误报成连接超时。
@@ -429,9 +433,14 @@ export class CodeBuddyAdapter extends LlmAdapter {
         // 语言只是装饰，失败本身不是。
       }
       const body = failureBody
+      // 原始 `code` 单独取出来给分类用：`readWireFailure` 只产出文案，而按文案
+      // 判会被上游改字改掉（Review Focus 第 5 条）。
+      let wireCode: number | undefined
       if (body !== undefined) {
         try {
-          failure = readWireFailure(JSON.parse(body) as WireError, language)
+          const parsed = JSON.parse(body) as WireError
+          wireCode = typeof parsed.code === 'number' ? parsed.code : undefined
+          failure = readWireFailure(parsed, language)
           if (failure.message !== undefined) message = failure.message
         } catch {
           // 只吞错误 body 的解析失败：状态码仍能标识这次失败，畸形 JSON 不许把它盖掉；
@@ -455,6 +464,35 @@ export class CodeBuddyAdapter extends LlmAdapter {
           && delay <= RATE_LIMIT_WAIT_CAP_MS
           && this.config.waitOnRateLimit?.() === true)
       const id = requestId(response.headers)
+      // 渠道校验拒收是确定性失败：同一个提示重发多少次都是同一个结果，重试只会
+      // 把一次失败拖成几十秒，所以不进上面那条退避重发路径，也不给可重试的码。
+      if (wireCode === CHANNEL_REJECTION_CODE) {
+        // 记我们**发出**的 uid，而不是响应里的什么（响应没有回显）。键名按
+        // withIdentityHeaders 的拼写取；$DSH_HOME 可能被多个账号共用，没有它
+        // 这条记录说不清是哪个账号被拦。
+        const sentUserId = authHeaders['X-User-Id']
+        try {
+          this.config.recordBlock?.({
+            at: Date.now(),
+            ...id === undefined ? {} : { requestId: String(id) },
+            ...sentUserId === undefined ? {} : { sentUserId },
+            endpoint: connection.baseURL,
+            systemLength: systemText.length,
+            fingerprintGuess: guessFingerprint(systemText),
+          })
+        } catch (error: unknown) {
+          // warn 也是注入的：它自己抛错不能替换即将抛出的 CHANNEL_BLOCKED。
+          try {
+            this.config.warn?.(`${PACKAGE_NAME}: recording a channel block failed: ${String(error)}`)
+          } catch {
+            // 诊断出口全坏时也只能沉默——请求结果优先。
+          }
+        }
+        throw new LlmError(message, 'CHANNEL_BLOCKED', {
+          status: response.status,
+          ...id === undefined ? {} : { requestId: id },
+        })
+      }
       throw new LlmError(message, failureCode(response.status, failure.detail, delay), {
         status: response.status,
         ...honorProviderDelay && delay !== undefined ? { providerRetryAfterMs: delay } : {},

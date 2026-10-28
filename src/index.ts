@@ -11,6 +11,7 @@ import { CodeBuddyRemoteService } from './remote.js'
 import { configureSettingsPage, readSettings } from './settings-ns.js'
 import type { CodeBuddySettings } from './settings-ns.js'
 import { CodeBuddyWebSync, gatewayRootOf } from './web-sync.js'
+import { recordChannelBlock } from './channel-health.js'
 import { registerCodeBuddyFlow } from './login-flow.js'
 import { CODEBUDDY_CHAT_BASE, CODEBUDDY_PROVIDER, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, PACKAGE_NAME, PLUGIN_NAME, RATE_LIMIT_WAIT_CAP_MS } from './constants.js'
 
@@ -111,6 +112,10 @@ const DEFAULT_RETRY_MAX_DELAY_MS = RATE_LIMIT_WAIT_CAP_MS
  * 逐项照搬宿主 normal 默认（而不是照抄一份常量）：宿主的可重试集合若在某次升级里
  * 变化，这里跟着变，不会悄悄落后。宿主契约里省略配置就是 normal，`always` 分支只为
  * 让类型收得住。
+ *
+ * `CHANNEL_BLOCKED`（渠道校验拒收）不在 `retryableCodes` 里是**有意的**：11128 是
+ * 确定性失败，重发只是把一次失败拖成几十秒。`mode:'always'` 会重试一切——那是用户
+ * 显式改策略后的选择，插件不再拦（同样不再替他判断该不该重试）。
  * @returns 一份可直接交给 {@link resolveRetryPolicy} 的配置。
  */
 function defaultRetryPolicyConfig(): RetryPolicyConfig {
@@ -194,6 +199,14 @@ export function apply(ctx: Context, config: Config = {}): void {
     waitOnRateLimit: () => settingsOf().waitOnRateLimit,
     // 诊断出口接宿主日志：适配器只在「服务说稍后再试却没说什么时候」时用一次。
     warn: (message) => { ctx.logger.warn(message) },
+    // 真实请求被判 11128 时把现场写进 $DSH_HOME 的健康文件。
+    // **不 await**：写盘失败（权限、磁盘满）绝不能让一次请求的结果变成错误，
+    // 诊断是旁路，请求本身才是主线。
+    recordBlock: (record) => {
+      void recordChannelBlock(record).catch((error: unknown) => {
+        ctx.logger.warn(`${PACKAGE_NAME}: recording a channel block failed: ${String(error)}`)
+      })
+    },
   })
   ctx.llm.registerAdapter([CODEBUDDY_PROVIDER], adapter)
 
@@ -241,6 +254,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   new CodeBuddyRemoteService(ctx, {
     session,
     settings: settingsOf,
+    // 探针与渠道指纹判定都按**聊天面**地址：gatewayRoot 是给 /agenttool 的，
+    // 刻意去掉了 /v2，拿它拼 /chat/completions 会打错地方。
+    chatBaseURL: () => resolved.baseURL,
+    // 探针结果写盘失败只记日志：结论已经算出来了，不能因为旁路文件丢了。
+    warn: (message) => { ctx.logger.warn(message) },
     searchBackend: async () => {
       await webSync.resync()
       return webSync.backendState()

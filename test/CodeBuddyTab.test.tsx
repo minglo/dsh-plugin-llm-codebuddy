@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { render, waitFor } from '@testing-library/react'
+import { act, render, waitFor } from '@testing-library/react'
 import { createElement } from 'react'
 
 vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
@@ -29,6 +29,9 @@ function makeRemote(view: unknown, status: Record<string, unknown> = {}) {
     pollLogin: async () => ok({ done: true }),
     logout: async () => ok(undefined),
     getSettings: async () => ok({ showUsage: true, webSearch: false }),
+    // 首屏只读历史（零外呼）；probe 只在点击时被调用。
+    channelHealth: async () => ok({ applicable: true }),
+    probe: async () => ok({ verdict: 'healthy', at: 1, model: 'm1', stages: [] }),
   }
 }
 
@@ -163,6 +166,221 @@ describe('CodeBuddyTab', () => {
     expect(body?.textContent).toContain('10 / 40') // 本月到期 = monthPool 口径（used/size）
     // 完整 view：明细档条渲染（usageError 文案不再出现）。
     expect(body?.textContent).not.toContain('usageError')
+  })
+
+  describe('渠道自检', () => {
+    it('renders the row only when the deployment runs the channel check', async () => {
+      const container = renderCard(makeRemote(partialView, { searchBackend: 'codebuddy' }))
+      await waitFor(() => expect(container.querySelector('.cb-probe')).not.toBeNull())
+      const notApplicable = renderCard({
+        ...makeRemote(partialView),
+        channelHealth: async () => ok({ applicable: false }),
+      })
+      await waitFor(() => expect(notApplicable.querySelector('.cb-probe')).toBeNull())
+    })
+
+    it('hides the row while signed out even when the deployment is applicable', async () => {
+      // 未登录时探针跑不出有意义的结论（连凭据都没有），applicable 再真也不出现。
+      // 没有这条，把显示条件里的 `signedIn &&` 删掉不会有人发现。
+      let release: ((value: unknown) => void) | undefined
+      const channelHealth = vi.fn(() => new Promise(resolve => { release = resolve }))
+      const container = renderCard({
+        ...makeRemote(partialView, { loggedIn: false }),
+        channelHealth,
+      })
+      await waitFor(() => expect(container.textContent).toContain('notSignedIn'))
+      await waitFor(() => expect(channelHealth).toHaveBeenCalled())
+      // 明确等历史读数落进 state 再断言「没有这一行」：早一步断言只是还没渲染。
+      await act(async () => { release?.(ok({ applicable: true })) })
+      expect(container.querySelector('.cb-probe')).toBeNull()
+    })
+
+    it('shows the stored verdict on the first screen without probing', async () => {
+      // 首屏显示的是盘里的历史结论：`channelHealth()` 只读文件，一次外呼都没有。
+      const container = renderCard({
+        ...makeRemote(partialView, { searchBackend: 'codebuddy' }),
+        channelHealth: async () => ok({ applicable: true, lastProbe: { verdict: 'auth', at: 1, model: '', stages: [] } }),
+      })
+      await waitFor(() => expect(container.textContent).toContain('probeAuth'))
+      expect(container.querySelector('.cb-probe')?.textContent).toContain('probeLastRun')
+    })
+
+    it('renders the last real block fingerprint location as readable copy', async () => {
+      // fingerprintGuess 一路传到浏览器，但卡片曾经从不渲染它。闭集三值必须映射成
+      // 人话，不能把 'identity-sentence' 这种内部标识符原样打上屏。
+      const container = renderCard({
+        ...makeRemote(partialView, { searchBackend: 'codebuddy' }),
+        channelHealth: async () => ok({
+          applicable: true,
+          lastBlock: { at: 2, fingerprintGuess: 'identity-sentence' },
+        }),
+      })
+      await waitFor(() => expect(container.textContent).toContain('probeFingerprintIdentity'))
+      expect(container.textContent).not.toContain('identity-sentence')
+    })
+
+    it('falls back for an inherited member instead of printing a function', async () => {
+      // `'toString'` 是「未知取值」最可能的样子：裸查表会从原型上取到函数，`??` 拦不住。
+      const container = renderCard({
+        ...makeRemote(partialView, { searchBackend: 'codebuddy' }),
+        channelHealth: async () => ok({
+          applicable: true,
+          lastBlock: { at: 2, fingerprintGuess: 'toString' },
+        }),
+      })
+      await waitFor(() => expect(container.textContent).toContain('probeFingerprintUnknown'))
+      expect(container.textContent).not.toContain('function')
+    })
+
+    it('does not probe on mount', async () => {
+      // 自检只能由点击触发：首屏只读历史。
+      const channelHealth = vi.fn(async () => ok({ applicable: true }))
+      const probe = vi.fn(async () => ok({ verdict: 'healthy', at: 1, model: 'm1', stages: [] }))
+      renderCard({ ...makeRemote(partialView, { searchBackend: 'codebuddy' }), channelHealth, probe })
+      await waitFor(() => expect(channelHealth).toHaveBeenCalled())
+      expect(probe).not.toHaveBeenCalled()
+    })
+
+    it('runs the probe on click and shows the verdict', async () => {
+      const container = renderCard(makeRemote(partialView, { searchBackend: 'codebuddy' }))
+      await waitFor(() => expect(container.querySelector('.cb-probe')).not.toBeNull())
+      container.querySelector<HTMLButtonElement>('.cb-probe button')?.click()
+      await waitFor(() => expect(container.textContent).toContain('probeHealthy'))
+    })
+
+    it('falls back to probeUnknown for a verdict this client does not know', async () => {
+      // 新主机可以下发本版本没见过的 verdict：兜底文案上屏，**绝不**打出原始枚举。
+      const container = renderCard({
+        ...makeRemote(partialView, { searchBackend: 'codebuddy' }),
+        probe: async () => ok({ verdict: 'brand-new-verdict', at: 1, model: 'm1', stages: [] }),
+      })
+      await waitFor(() => expect(container.querySelector('.cb-probe')).not.toBeNull())
+      container.querySelector<HTMLButtonElement>('.cb-probe button')?.click()
+      await waitFor(() => expect(container.textContent).toContain('probeUnknown'))
+      expect(container.textContent).not.toContain('brand-new-verdict')
+    })
+
+    it('falls back to probeUnknown for an inherited member such as toString', async () => {
+      // 查表若直接 `table[verdict] ?? fallback`，'toString' 会取到 Object.prototype
+      // 上的函数（truthy），兜底不生效，函数被当成翻译结果交给 React。
+      const container = renderCard({
+        ...makeRemote(partialView, { searchBackend: 'codebuddy' }),
+        probe: async () => ok({ verdict: 'toString', at: 1, model: 'm1', stages: [] }),
+      })
+      await waitFor(() => expect(container.querySelector('.cb-probe')).not.toBeNull())
+      container.querySelector<HTMLButtonElement>('.cb-probe button')?.click()
+      await waitFor(() => expect(container.textContent).toContain('probeUnknown'))
+      expect(container.textContent).not.toContain('toString')
+    })
+
+    it('fills {stage}/{status} with the failing observation', async () => {
+      // 设计文档要求判定句逐字保留占位符语义：段名与状态码是复核判定唯一的证据。
+      // 用真实的模板替换 `t`，否则测试里的 t 只返回键名，占位符路径根本没被走到。
+      const t = (key: string): string =>
+        key === 'probeStageFailed' ? '第 {stage} 步返回 HTTP {status}' : key
+      const container = renderCard({
+        ...makeRemote(partialView, { searchBackend: 'codebuddy' }),
+        channelHealth: async () => ok({
+          applicable: true,
+          lastProbe: {
+            verdict: 'stage-failed', at: 1, model: 'm1',
+            stages: [{ stage: 'A', status: 200 }, { stage: 'B', status: 502 }],
+          },
+        }),
+      }, { t })
+      await waitFor(() => expect(container.textContent).toContain('第 B 步返回 HTTP 502'))
+    })
+
+    it('uses an em dash when a stage-failed verdict has no non-200 stage', async () => {
+      // 理论上 stage-failed 必有失败阶段；手写/偏斜的 wire 数据可能没有。
+      // 此时读数仍要读得通：两个占位符都落破折号，而不是把 {stage} 原样上屏。
+      const t = (key: string): string =>
+        key === 'probeStageFailed' ? '第 {stage} 步返回 HTTP {status}' : key
+      const container = renderCard({
+        ...makeRemote(partialView, { searchBackend: 'codebuddy' }),
+        channelHealth: async () => ok({
+          applicable: true,
+          lastProbe: {
+            verdict: 'stage-failed', at: 1, model: 'm1',
+            stages: [{ stage: 'A', status: 200 }],
+          },
+        }),
+      }, { t })
+      await waitFor(() => expect(container.textContent).toContain('第 — 步返回 HTTP —'))
+    })
+
+    it('reports a rejected probe and keeps the previous reading', async () => {
+      // 调用失败（宿主拒绝 / 会话已释放）不编 verdict：说「没完成」，但上一次的
+      // 结论仍留在屏上——它确实是「上次」发生的事，不该被一次失败抹掉。
+      const container = renderCard({
+        ...makeRemote(partialView, { searchBackend: 'codebuddy' }),
+        channelHealth: async () => ok({
+          applicable: true,
+          lastProbe: { verdict: 'auth', at: 1, model: '', stages: [] },
+        }),
+        probe: async () => { throw new Error('host refused') },
+      })
+      await waitFor(() => expect(container.textContent).toContain('probeAuth'))
+      container.querySelector<HTMLButtonElement>('.cb-probe button')?.click()
+      await waitFor(() => expect(container.textContent).toContain('probeFailed'))
+      expect(container.textContent).toContain('probeAuth')
+    })
+
+    it('shows the running label while the probe is in flight', async () => {
+      let release: ((value: unknown) => void) | undefined
+      const probe = vi.fn(() => new Promise(resolve => { release = resolve }))
+      const container = renderCard({ ...makeRemote(partialView, { searchBackend: 'codebuddy' }), probe })
+      await waitFor(() => expect(container.querySelector('.cb-probe')).not.toBeNull())
+      const button = container.querySelector<HTMLButtonElement>('.cb-probe button')
+      button?.click()
+      await waitFor(() => expect(button?.textContent).toBe('probeRunning'))
+      release?.(ok({ verdict: 'healthy', at: 1, model: 'm1', stages: [] }))
+      await waitFor(() => expect(button?.textContent).toBe('probeRun'))
+    })
+
+    it('keeps the card when the health read fails, with the rejection handled', async () => {
+      // 只断言 DOM 不够：Vitest 会吸收未处理的拒绝，把 effect 里的 try/catch 删掉
+      // 这些断言照样全绿。这里直接监听 process 的 unhandledRejection——读数失败
+      // 必须被 effect 接住，绝不能漏成进程级未处理拒绝。
+      const escaped: unknown[] = []
+      const onUnhandled = (reason: unknown): void => { escaped.push(reason) }
+      process.on('unhandledRejection', onUnhandled)
+      try {
+        let fail: ((error: Error) => void) | undefined
+        const channelHealth = vi.fn(() => new Promise((_resolve, reject) => { fail = reject }))
+        const container = renderCard({
+          ...makeRemote(partialView, { searchBackend: 'codebuddy' }),
+          channelHealth,
+        })
+        await waitFor(() => expect(channelHealth).toHaveBeenCalled())
+        await act(async () => { fail?.(new Error('unreadable')) })
+        // unhandledRejection 在微任务队列清空后的下一拍才判定：等一个宏任务。
+        await new Promise(resolve => setTimeout(resolve, 0))
+
+        expect(escaped).toEqual([])
+        // 诊断读不到只丢自检这一块：卡片其余部分（用户 ID、额度、开关）照常渲染。
+        expect(container.querySelector('.cb-setting-group')).not.toBeNull()
+        expect(container.querySelector('.cb-probe')).toBeNull()
+        expect(container.textContent).toContain('u-1')
+      } finally {
+        process.off('unhandledRejection', onUnhandled)
+      }
+    })
+
+    it('disables the button while the probe is in flight', async () => {
+      let release: (v: unknown) => void = () => {}
+      const probe = vi.fn(() => new Promise(resolve => { release = resolve }))
+      const container = renderCard({ ...makeRemote(partialView, { searchBackend: 'codebuddy' }), probe })
+      await waitFor(() => expect(container.querySelector('.cb-probe')).not.toBeNull())
+      // 点击两次：第二次不能真的发出第二轮（按钮此刻已 disabled，ref 是同一帧的兜底）。
+      const button = container.querySelector<HTMLButtonElement>('.cb-probe button')
+      button?.click()
+      button?.click()
+      await waitFor(() => expect(button?.disabled).toBe(true))
+      release(ok({ verdict: 'healthy', at: 1, model: 'm1', stages: [] }))
+      await waitFor(() => expect(button?.disabled).toBe(false))
+      expect(probe).toHaveBeenCalledTimes(1)
+    })
   })
 
   describe('search backend badge', () => {

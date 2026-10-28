@@ -3,7 +3,14 @@ import type { ContentBlock, GenerateOptions, RequestMessage } from '@deepseek-ai
 import { rewriteHarnessIdentity } from './channel-fingerprint.js'
 import type { WireMessage, WireRequest, WireTool } from './types.js'
 
-function flattenText(blocks: readonly ContentBlock[]): string {
+/**
+ * 把内容块里的文本按顺序拼起来。
+ *
+ * 导出：适配器判定指纹时也要按同一种方式取文本（`options.system` 与 system
+ * 消息两条来路），各写一份 filter/map/join 迟早漂移——序列化改了取法，指纹
+ * 读数还按旧规则，诊断就会说谎。
+ */
+export function flattenText(blocks: readonly ContentBlock[]): string {
   return blocks.filter(block => block.type === 'text').map(block => block.text).join('')
 }
 

@@ -8,13 +8,16 @@ import { UsageCache, usageCacheKey } from './usage-cache.js'
 import { decodeJwtPayload, resolveIdentity } from './jwt.js'
 import { requestAuthState } from './codebuddy.js'
 import { completeLogin } from './login-flow.js'
+import { isCodeBuddyEndpoint, FINGERPRINT_GUESSES } from './channel-fingerprint.js'
+import { probeChannel, readChannelHealth } from './channel-health.js'
 import type { CodeBuddySession } from './session.js'
 import { readSettings, updateSettings } from './settings-ns.js'
 import type { CodeBuddySettings } from './settings-ns.js'
 import { effectiveRate, promotionFor, tierFor, windowTextOf } from './promotions.js'
 import type { CodeBuddyPromotion, CodeBuddyTier } from './types.js'
-import type { CodeBuddyModelEntry, CodeBuddyModelsResult, CheckinResultView, CheckinStatusView, LocalizedText, LoginPoll, LoginStart, PromotionView, SearchBackendState, SettingsView, StatusView, TierView, UsageResult } from './remote-types.js'
-import { USAGE_CACHE_TTL_MS } from './constants.js'
+import { CHANNEL_VERDICTS } from './remote-types.js'
+import type { ChannelBlockRecord, ChannelHealthView, CodeBuddyModelEntry, CodeBuddyModelsResult, CheckinResultView, CheckinStatusView, LocalizedText, LoginPoll, LoginStart, ProbeResultView, ProbeStage, PromotionView, SearchBackendState, SettingsView, StatusView, TierView, UsageResult } from './remote-types.js'
+import { CODEBUDDY_CHAT_BASE, USAGE_CACHE_TTL_MS } from './constants.js'
 
 /**
  * 「签到态读不到」的回执。
@@ -60,6 +63,26 @@ export interface CodeBuddyRemoteOptions {
    * 可能是错的，而且不会有任何事件来纠正它。
    */
   searchBackend?: () => SearchBackendState | Promise<SearchBackendState>
+  /**
+   * 聊天面的 base 地址（默认 `https://copilot.tencent.com/v2`）。
+   *
+   * 与 `CodeBuddyConnectionOptions.baseURL` 同源，**不是** web-sync 的
+   * `gatewayRootOf()`——后者刻意剥掉了 `/v2`，探针打的是 `/chat/completions`
+   * 与渠道指纹判定，都要用聊天面这份完整地址。
+   *
+   * optional 是给 headless / 测试组合留的：它们可以不关心探针，只构造服务。
+   * 缺省按官方 chat base 判 applicable——但这**不是**真实部署的推荐形态：
+   * baseURL 改到自建网关却不注入这里，就会对着官方地址判出一个错误结论。
+   * `apply()` 因此总是注入实时值。
+   */
+  chatBaseURL?: () => string
+  /**
+   * 诊断旁路的告警出口：探针结果写盘失败时记一行日志，而不是让 probe() 拒绝。
+   *
+   * 由 `apply()` 接宿主 logger；独立实例化（测试、headless）时缺省，探针仍然
+   * 返回计算结果，只是没人收到这条 warn。
+   */
+  warn?: (message: string) => void
 }
 
 export class CodeBuddyRemoteService extends TypertRemoteService {
@@ -227,6 +250,53 @@ export class CodeBuddyRemoteService extends TypertRemoteService {
   }
 
   /**
+   * 卡片首屏要显示的渠道健康态：上次探针结论 + 最近一次真实拦截。
+   *
+   * **只读盘、零外呼**——与 probe() 分开正是为了这条：卡片挂载时若调用 probe()，
+   * 每次打开设置页都会自动打三发请求，违背「不做常驻检查」。
+   *
+   * applicable 按 chat base 判：自建网关没有渠道校验，客户端据此整行隐藏。
+   */
+  @Remote
+  async channelHealth(): Promise<ChannelHealthView> {
+    const chatBase = this.options.chatBaseURL?.() ?? CODEBUDDY_CHAT_BASE
+    const stored = await readChannelHealth()
+    // 读盘刻意宽松、wire 必须严格：坏记录当它不存在，别让整张卡片陪葬。
+    const lastProbe = isDisplayableProbe(stored.lastProbe) ? stored.lastProbe : undefined
+    const lastBlock = isDisplayableBlock(stored.lastBlock) ? stored.lastBlock : undefined
+    return {
+      applicable: isCodeBuddyEndpoint(chatBase),
+      // 缺省即「还没有记录」：不发明一个空结论，客户端按没有渲染。
+      ...lastProbe === undefined ? {} : { lastProbe },
+      // 只下发卡片需要的两件事；请求 id 与 endpoint 留在宿主侧。
+      ...lastBlock === undefined ? {} : { lastBlock: { at: lastBlock.at, fingerprintGuess: lastBlock.fingerprintGuess } },
+    }
+  }
+
+  /**
+   * 跑一次三发诊断探针。**只由用户点按钮触发**，宿主没有任何自动路径调它。
+   *
+   * 不接住 probeChannel 的拒绝（调用方取消、SessionUnavailableError）：Remote
+   * 调用在浏览器侧表现为一次错误，这正是事实。吞掉它只能编一个假 verdict，
+   * 而假 verdict 会覆盖 lastProbe、把用户自己的取消说成渠道故障。
+   */
+  @Remote
+  async probe(): Promise<ProbeResultView> {
+    // 模型由 probeChannel 从目录取：空目录不等于没登录——也可能是目录从未成功
+    // 读过。那里的守卫会先用 authHeaders() 区分两者；这里再判一次只会把「读目录
+    // 失败」提前说成「凭据失效，请重新登录」，让一个已登录用户白跑浏览器握手。
+    //
+    // 今天**不传** signal：`remote.probe()` 的 wire 契约没有取消通道，浏览器侧也
+    // 还没有取消入口。probeChannel 保留这个参数是给卡片将来的取消按钮用的，
+    // 不是给现在的调用方漏传。
+    return probeChannel({
+      session: this.options.session,
+      baseURL: this.options.chatBaseURL?.() ?? CODEBUDDY_CHAT_BASE,
+      ...this.options.warn === undefined ? {} : { warn: this.options.warn },
+    })
+  }
+
+  /**
    * 读富化后的整份模型目录：每个条目带上当前展示价、可选的双语描述，
    * 以及此刻生效的一条促销与命中的分层。
    *
@@ -271,6 +341,53 @@ export class CodeBuddyRemoteService extends TypertRemoteService {
     })
     return { loggedIn: true, models: entries }
   }
+}
+
+/**
+ * 读盘内容能不能原样通过客户端的 strict codec？
+ *
+ * `readChannelHealth()` 刻意宽松（见 channel-health.ts）：verdict 只查是不是
+ * 字符串、stages 只查是不是数组，手改或版本偏斜的文件照样读得出来。但 wire 上的
+ * codec 由宿主网关逐字段 parse——一个未知 verdict 或坏掉的 stage 会让整个
+ * `channelHealth()` 调用抛错，连 `applicable` 与 `lastBlock` 一起丢掉，正好是
+ * Task 4 要避免的「卡片因旁路数据而消失」。
+ *
+ * 所以下发前按同一份闭集复验一次：过不了的就当作没有这条记录。列表取自
+ * remote-types 的 CHANNEL_VERDICTS，与 descriptor 的 z.enum 同源。
+ */
+function isDisplayableProbe(value: unknown): value is ProbeResultView {
+  if (typeof value !== 'object' || value === null) return false
+  const probe = value as Record<string, unknown>
+  return typeof probe.at === 'number'
+    && typeof probe.model === 'string'
+    && Array.isArray(probe.stages)
+    && probe.stages.every(isDisplayableStage)
+    && typeof probe.verdict === 'string'
+    && (CHANNEL_VERDICTS as readonly string[]).includes(probe.verdict)
+}
+
+/** 单个阶段的字段类型必须和 descriptor 的 codec 对得上（缺省字段合法）。 */
+function isDisplayableStage(value: unknown): value is ProbeStage {
+  if (typeof value !== 'object' || value === null) return false
+  const stage = value as Record<string, unknown>
+  return (stage.stage === 'A' || stage.stage === 'B' || stage.stage === 'C')
+    && (stage.status === undefined || typeof stage.status === 'number')
+    && (stage.code === undefined || typeof stage.code === 'number')
+    && (stage.requestId === undefined || typeof stage.requestId === 'string')
+    && (stage.quota === undefined || typeof stage.quota === 'boolean')
+}
+
+/**
+ * `lastBlock` 的同一道复核。
+ *
+ * channel-health 的读盘守卫已经把它收窄成 `{ at, fingerprintGuess }`，但
+ * fingerprintGuess 的合法值同样由 descriptor 的 enum 约束；这里按同一份列表
+ * 再验一次，理由与 lastProbe 相同：一条坏值不该让整张卡片消失。
+ */
+function isDisplayableBlock(value: ChannelBlockRecord | undefined): value is ChannelBlockRecord {
+  return value !== undefined
+    && Number.isFinite(value.at)
+    && FINGERPRINT_GUESSES.includes(value.fingerprintGuess)
 }
 
 /**

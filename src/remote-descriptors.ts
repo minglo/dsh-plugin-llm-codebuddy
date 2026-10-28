@@ -4,6 +4,8 @@
 // dsh-api-gateway client 的 $mount validateContribution（requireStrictDescriptor）通过。
 import { z } from 'zod'
 import type { InvocationDescriptor, TypertRemoteContribution } from '@deepseek-ai/dsh-typert-protocol'
+import { FINGERPRINT_GUESSES } from './channel-fingerprint.js'
+import { CHANNEL_VERDICTS } from './remote-types.js'
 import { PACKAGE_NAME } from './constants.js'
 
 const NS = 'codebuddy'
@@ -46,6 +48,37 @@ const usageViewSchema = z.object({
     remain: z.number(),
     size: z.number(),
     used: z.number(),
+  })),
+})
+
+/**
+ * 判定的 11 个取值：5 个是本插件自己的判断，6 个是上游拒绝的归类
+ * （见 remote-types.ts 的 ChannelVerdict）。
+ *
+ * 取值列表从共享常量取，不在此处重列：宿主下发前用同一份闭集复验读盘内容，
+ * 两边各写一份的话，加一个 verdict 只改一边就会让新结论在 decode 阶段消失。
+ *
+ * 用 enum 而非 string：客户端要按结论分支渲染文案，一个拼错的 verdict
+ * 会让整张卡片落到「未知」分支——不如在 decode 阶段就拒绝。
+ */
+const verdictSchema = z.enum(CHANNEL_VERDICTS)
+
+/**
+ * 一次探针的 wire 形状。
+ *
+ * 阶段字段全部 optional：只有 fetch 抛错时阶段连 status 都没有，而那张
+ * 「连不上」的观测同样必须能下发——否则最需要看的那次探测会在 decode 阶段消失。
+ */
+const probeResultSchema = z.object({
+  verdict: verdictSchema,
+  at: z.number(),
+  model: z.string(),
+  stages: z.array(z.object({
+    stage: z.enum(['A', 'B', 'C']),
+    status: z.number().optional(),
+    code: z.number().optional(),
+    requestId: z.string().optional(),
+    quota: z.boolean().optional(),
   })),
 })
 
@@ -197,6 +230,24 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
         credit: z.number(),
         streakDays: z.number(),
       }),
+    }),
+    direct('channelHealth', {
+      // 卡片首屏的只读数据：上次探针结论 + 上次真实拦截。**零外呼**，
+      // 所以它和 probe 必须是两个方法——首屏不许触发三发诊断。
+      result: z.object({
+        // 本部署是否跑渠道校验（仅官方端点）；假时客户端整行隐藏。
+        applicable: z.boolean(),
+        lastProbe: probeResultSchema.optional(),
+        // 刻意收窄：请求 id / endpoint 只在宿主落盘，浏览器不需要。
+        lastBlock: z.object({
+          at: z.number(),
+          fingerprintGuess: z.enum(FINGERPRINT_GUESSES),
+        }).optional(),
+      }),
+    }),
+    direct('probe', {
+      // 只有用户点按钮才会走到这里；宿主不做定时或首屏自动调用。
+      result: probeResultSchema,
     }),
   ],
 }

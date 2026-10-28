@@ -1,7 +1,7 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LocalCredentialProvider } from '@deepseek-ai/dsh-credentials-local'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CodeBuddyRemoteService } from '../src/remote.js'
@@ -11,6 +11,7 @@ import * as checkin from '../src/checkin.js'
 import type { CodeBuddyIdentity } from '../src/codebuddy.js'
 import type { CodeBuddyGrant } from '../src/auth.js'
 import type { CodeBuddySession } from '../src/session.js'
+import { NotLoggedInError, SessionUnavailableError } from '../src/session.js'
 import type { UsageView } from '../src/usage.js'
 import { readGrant, writeGrant } from '../src/auth.js'
 
@@ -18,6 +19,8 @@ const scratchDirs: string[] = []
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllEnvs()
+  vi.unstubAllGlobals()
   for (const dir of scratchDirs.splice(0)) {
     try { rmSync(dir, { recursive: true, force: true }) } catch { /* best-effort cleanup */ }
   }
@@ -715,6 +718,133 @@ describe('CodeBuddyRemoteService', () => {
       expect('rate' in result.models[0]!).toBe(false)
       expect('rate' in result.models[1]!).toBe(false)
     })
+  })
+})
+
+describe('channelHealth / probe', () => {
+  const chatBase = 'https://copilot.tencent.com/v2'
+
+  /** 每个用例一个独立 home：健康态路径由 DSH_HOME 决定，用例之间不共享。 */
+  function scratchHome(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cb-remote-health-'))
+    scratchDirs.push(dir)
+    vi.stubEnv('DSH_HOME', dir)
+    return dir
+  }
+
+  it('channelHealth reads stored health without any outbound request', async () => {
+    scratchHome()
+    const { recordChannelBlock } = await import('../src/channel-health.js')
+    await recordChannelBlock({
+      at: 2,
+      endpoint: chatBase,
+      systemLength: 10,
+      fingerprintGuess: 'identity-sentence',
+    })
+    // 卡片的第一次读取必须零外呼：任何请求都会在这里直接抛错。
+    vi.stubGlobal('fetch', () => { throw new Error('channelHealth must not touch the network') })
+    const ctx = await setupScratch()
+    const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session, chatBaseURL: () => chatBase })
+
+    await expect(svc.channelHealth()).resolves.toEqual({
+      applicable: true,
+      lastBlock: { at: 2, fingerprintGuess: 'identity-sentence' },
+    })
+  })
+
+  it('channelHealth marks a non-CodeBuddy endpoint as not applicable', async () => {
+    // 自建网关没有渠道校验：客户端据此整行隐藏，而不是显示一个永远健康的探针。
+    scratchHome()
+    const ctx = await setupScratch()
+    const svc = new CodeBuddyRemoteService(ctx, {
+      session: sessionStub().session,
+      chatBaseURL: () => 'https://proxy.example/v1',
+    })
+
+    await expect(svc.channelHealth()).resolves.toEqual({ applicable: false })
+  })
+
+  /** 直接写盘，模拟手改 / 版本偏斜 / 旧宿主留下的记录。 */
+  function writeHealth(home: string, value: unknown): void {
+    writeFileSync(join(home, 'codebuddy-channel-health.json'), JSON.stringify(value))
+  }
+
+  it('drops a lastProbe with an unknown verdict instead of failing the whole call', async () => {
+    // readChannelHealth 刻意宽松（verdict 只查字符串），但 wire 上的 strict codec
+    // 只认 11 个值：原样下发会让宿主网关 parse 失败，连 applicable 与 lastBlock
+    // 一起丢掉——正是「卡片不该因一份旁路数据而消失」要防的场景。
+    const home = scratchHome()
+    writeHealth(home, {
+      lastProbe: { verdict: 'from-the-future', at: 1, model: 'm1', stages: [] },
+      lastBlock: { at: 2, requestId: 'r2', endpoint: chatBase, systemLength: 10, fingerprintGuess: 'identity-sentence' },
+    })
+    const ctx = await setupScratch()
+    const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session, chatBaseURL: () => chatBase })
+
+    await expect(svc.channelHealth()).resolves.toEqual({
+      applicable: true,
+      lastBlock: { at: 2, fingerprintGuess: 'identity-sentence' },
+    })
+  })
+
+  it('drops a lastProbe whose stage shape the client codec would reject', async () => {
+    // stages 里的元素同样过 strict codec：缺 stage 的 `{}` 会让整个调用 parse 失败。
+    const home = scratchHome()
+    writeHealth(home, {
+      lastProbe: { verdict: 'healthy', at: 1, model: 'm1', stages: [{}] },
+    })
+    const ctx = await setupScratch()
+    const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session, chatBaseURL: () => chatBase })
+
+    await expect(svc.channelHealth()).resolves.toEqual({ applicable: true })
+  })
+
+  it('falls back to the default chat base when the composition does not pass one', async () => {
+    // headless / 旧组合可能只构造服务、不传 chatBaseURL。缺省按官方 chat base
+    // 判 applicable，而不是在调用时炸成 `this.options.chatBaseURL is not a function`。
+    scratchHome()
+    const ctx = await setupScratch()
+    const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session })
+
+    await expect(svc.channelHealth()).resolves.toEqual({ applicable: true })
+  })
+
+  it('probe returns an auth verdict without the network when the account is signed out', async () => {
+    vi.stubGlobal('fetch', () => { throw new Error('probe must not touch the network') })
+    const ctx = await setupScratch()
+    const session = {
+      modelsOrEmpty: async () => [],
+      authHeaders: async () => { throw new NotLoggedInError('signed out') },
+    } as unknown as CodeBuddySession
+    const svc = new CodeBuddyRemoteService(ctx, { session, chatBaseURL: () => chatBase })
+
+    await expect(svc.probe()).resolves.toMatchObject({ verdict: 'auth', model: '', stages: [] })
+  })
+
+  it('probe does not turn an unreadable catalog into an auth verdict', async () => {
+    // 目录读失败 ≠ 凭据失效：报 auth 会让一个已登录用户白跑一次浏览器握手。
+    vi.stubGlobal('fetch', () => { throw new Error('probe must not touch the network') })
+    const ctx = await setupScratch()
+    const session = {
+      modelsOrEmpty: async () => [],
+      authHeaders: async () => ({ Authorization: 'Bearer t' }),
+    } as unknown as CodeBuddySession
+    const svc = new CodeBuddyRemoteService(ctx, { session, chatBaseURL: () => chatBase })
+
+    await expect(svc.probe()).resolves.toMatchObject({ verdict: 'unavailable', model: '', stages: [] })
+  })
+
+  it('probe lets a session failure reject instead of fabricating a verdict', async () => {
+    // 刷新端点不可达不是一次渠道观测；吞成 verdict 会让卡片把基础设施故障
+    // 说成渠道问题。Remote 调用在浏览器侧报错才是事实。
+    const ctx = await setupScratch()
+    const session = {
+      modelsOrEmpty: async () => [{ id: 'm1' }],
+      authHeaders: async () => { throw new SessionUnavailableError('refresh endpoint unreachable') },
+    } as unknown as CodeBuddySession
+    const svc = new CodeBuddyRemoteService(ctx, { session, chatBaseURL: () => chatBase })
+
+    await expect(svc.probe()).rejects.toBeInstanceOf(SessionUnavailableError)
   })
 })
 

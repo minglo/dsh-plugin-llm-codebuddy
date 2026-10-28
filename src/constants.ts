@@ -12,7 +12,7 @@ export const CODEBUDDY_CHAT_BASE = `${CODEBUDDY_ENDPOINT}/v2`
  * VSCode 而不是未知客户端；两边版本号需手工保持一致。
  */
 export const CODEBUDDY_IDE_NAME = 'VSCode'
-/** 读取目录/用量时发送的 UA。chat 面另有 DSH 归属头，见 adapter 的 APP_IDENTITY。 */
+/** 读取目录/用量时发送的 UA。chat 面另有 DSH 归属头，见 chat-headers.ts。 */
 export const CODEBUDDY_IDE_VERSION = '4.12.0'
 /** 上报的宿主 IDE 版本（VSCode）。与上面的产品版本是两回事。 */
 export const CODEBUDDY_VSCODE_VERSION = '1.139.0'
@@ -107,6 +107,13 @@ export const USAGE_CACHE_TTL_MS = 60_000
 export const LOGIN_TIMEOUT_MS = 10 * 60 * 1000
 export const LOGIN_POLL_INTERVAL_MS = 1_000
 export const AUTH_PENDING_CODE = 11217
+/** 上游渠道校验拒收：`Illegal API invocation from an unapproved channel`。 */
+export const CHANNEL_REJECTION_CODE = 11128
+/**
+ * 上游把厂商侧瞬时校验失败包装成 400 抛回的码：同构请求稍后重发即成功。
+ * 宿主只重试 RATE_LIMIT/SERVER/TIMEOUT/TRANSPORT，400 一律不重试，故由插件自己认。
+ */
+export const TRANSIENT_UPSTREAM_CODE = 11133
 export const CODEBUDDY_USAGE_ENDPOINT = 'https://www.codebuddy.cn'
 /** 单次外呼（登录握手/目录）硬超时。chat 流只用它护连接+响应头，body 由 idleWatchdog 管。 */
 export const REQUEST_TIMEOUT_MS = 60_000

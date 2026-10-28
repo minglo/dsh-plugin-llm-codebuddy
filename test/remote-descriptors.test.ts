@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import TYPERT_REMOTE from '../src/remote-descriptors.js'
 import type { TypertCodec } from '@deepseek-ai/dsh-typert-protocol'
 
-const METHODS = ['status', 'usage', 'startLogin', 'pollLogin', 'logout', 'getSettings', 'setSettings', 'models', 'checkinStatus', 'checkin'] as const
+const METHODS = ['status', 'usage', 'startLogin', 'pollLogin', 'logout', 'getSettings', 'setSettings', 'models', 'checkinStatus', 'checkin', 'channelHealth', 'probe'] as const
 function asStrict(codec: TypertCodec): Extract<TypertCodec, { mode: 'strict' }> {
   if (codec.mode !== 'strict') throw new Error(`expected strict codec, got mode ${codec.mode}`)
   return codec
@@ -55,11 +55,17 @@ const samples: Record<string, unknown> = {
     todayCredit: 0,
   },
   checkin: { success: true, credit: 50, streakDays: 4 },
+  channelHealth: {
+    applicable: true,
+    lastProbe: { verdict: 'healthy', at: 1, model: 'm1', stages: [{ stage: 'A', status: 200 }] },
+    lastBlock: { at: 2, fingerprintGuess: 'identity-sentence' },
+  },
+  probe: { verdict: 'healthy', at: 1, model: 'm1', stages: [] },
 }
 
 describe('TYPERT_REMOTE (client remote descriptors)', () => {
-  it('declares exactly the ten codebuddy methods', () => {
-    expect(TYPERT_REMOTE.descriptors).toHaveLength(10)
+  it('declares exactly the twelve codebuddy methods', () => {
+    expect(TYPERT_REMOTE.descriptors).toHaveLength(12)
     const methods = TYPERT_REMOTE.descriptors.map(d => d.method)
     expect(methods).toEqual([...METHODS])
   })

@@ -1,4 +1,5 @@
 // host 与 client 共享的 wire 类型，唯一来源
+import type { FingerprintGuess } from './channel-fingerprint.js'
 import type { UsageView } from './usage.js'
 
 /**
@@ -111,6 +112,114 @@ export interface SettingsView {
 }
 
 export type { UsageView }
+
+/**
+ * 一次真实请求被上游渠道校验拒收（`code=11128`）的现场（宿主与客户端共享的
+ * wire 类型，唯一来源）。
+ *
+ * 放在这里而不是 channel-health 里：`adapter` 只能 import 类型、不能 import 那个
+ * 实现，否则适配器就要依赖落盘模块，两条边会成环。
+ *
+ * 这组字段是规则再收紧时唯一的证据——用户下次报障，`recentBlocks` 直接说明
+ * 「什么时候开始拦的、拦的是什么形状的提示」。
+ */
+export interface ChannelBlockRecord {
+  /** 被拒收的时刻（宿主时钟，毫秒）。 */
+  at: number
+  /** 上游回执里的 `x-request-id`；没有时缺省。 */
+  requestId?: string
+  /**
+   * 这次请求**发出**的 `X-User-Id`（值来自凭据 JWT），不是服务端回执——响应里
+   * 没有这个头。
+   *
+   * 可选：旧记录、以及不带 uid 的凭据都没有它。`$DSH_HOME` 可能被多个账号共用，
+   * 缺了它，文件就说不清是哪一次登录被拦；字段名写死为 `sentUserId`，避免读的人
+   * 以为它是服务端回显。
+   */
+  sentUserId?: string
+  /** 请求打到的网关地址，用来区分官方站点与自建代理。 */
+  endpoint: string
+  /**
+   * 该次请求 system 正文的**原始**长度。
+   *
+   * 记宿主交来的那一份，不是改写后发出去的那一份：改写保证发出去的正文不再含
+   * 整句指纹，按它判定永远得到 `unknown`，字段就退化成常量。
+   */
+  systemLength: number
+  /** 已确立的指纹在原始 system 里的位置（见 channel-fingerprint.ts）。 */
+  fingerprintGuess: FingerprintGuess
+}
+
+/**
+ * 探针对渠道校验的结论（宿主与客户端共享的 wire 类型，唯一来源）。
+ *
+ * 前 5 个是本插件自己算出来的判断：规则在且改写有效（healthy）、
+ * 规则已经不拦了（rule-gone）、改写是否还管用（neutralization-broken）、
+ * 证据自相矛盾（inconsistent）、探针自身没跑完（stage-failed）。
+ * 后 6 个是把上游的拒绝原样归类：渠道拒收（channel-rejected）、认证失败（auth）、
+ * 限流（rate-limited）、额度用尽（quota）、服务不可用（unavailable）、
+ * 根本连不上（unreachable）。
+ *
+ * 分成两段是刻意的：客户端对「我们测出来的」和「服务端说的」给的是不同文案，
+ * 混成一个枚举会让「渠道没问题但这次探测被限流」被误报成渠道故障。
+ *
+ * 声明成运行时常量而非纯类型：宿主要在下发前按同一份闭集复验读盘内容，
+ * client descriptor 的 z.enum 也从这里取值——两处各列一份迟早会漂移，
+ * 而漂移的后果是一份旧文件让整张卡片 decode 失败。
+ */
+export const CHANNEL_VERDICTS = [
+  'healthy', 'rule-gone', 'neutralization-broken', 'inconsistent', 'stage-failed',
+  'channel-rejected', 'auth', 'rate-limited', 'quota', 'unavailable', 'unreachable',
+] as const
+
+export type ChannelVerdict = typeof CHANNEL_VERDICTS[number]
+
+/**
+ * 探针三阶段里某一阶段的观察值（宿主与客户端共享的 wire 类型，唯一来源）。
+ *
+ * 只记事实、不记判断：HTTP 状态、上游信封里的 code、回执 id、以及这次响应
+ * 是不是在说额度用尽。判定表吃这组事实得出 verdict，因此判定不需要网络也不需要
+ * 读文案——可以逐行测。
+ */
+export interface ProbeStage {
+  stage: 'A' | 'B' | 'C'
+  status?: number
+  code?: number
+  requestId?: string
+  /**
+   * 该阶段响应是否在说「额度用尽」。由探针读取响应体时用宿主的
+   * `isQuotaExceededError(text)` 算好填进来，判定函数因此不碰文案、不碰网络。
+   */
+  quota?: boolean
+}
+
+/**
+ * 一次探针的结果（宿主与客户端共享的 wire 类型，唯一来源）。
+ *
+ * `stages` 全量下发而不只是 verdict：用户报障时「哪一阶段、什么状态码」是唯一
+ * 能复查的东西，只留一个结论等于把证据扔掉。
+ */
+export interface ProbeResultView {
+  verdict: ChannelVerdict
+  at: number
+  /** 探针使用的模型；未登录、或目录读不出而没有可用模型时为空串，客户端此时只显示 verdict。 */
+  model: string
+  stages: ProbeStage[]
+}
+
+/**
+ * 渠道校验卡片要显示的全部内容（宿主与客户端共享的 wire 类型，唯一来源）。
+ *
+ * 与宿主落盘用的完整记录（见 `channel-health.ts` 的 `StoredHealth`）相比是刻意
+ * 收窄的：磁盘上留的是完整拦截记录（排查用），下发给浏览器的只有「最近一次拦截的
+ * 时刻与指纹位置」——请求 id 与 endpoint 属于机器内部信息，卡片不需要。
+ */
+export interface ChannelHealthView {
+  /** 本部署是否跑渠道校验（仅官方端点）。为假时客户端整行隐藏。 */
+  applicable: boolean
+  lastProbe?: ProbeResultView
+  lastBlock?: { at: number; fingerprintGuess: FingerprintGuess }
+}
 
 /**
  * 一条倍率读数（宿主与客户端共享的 wire 类型，唯一来源）。

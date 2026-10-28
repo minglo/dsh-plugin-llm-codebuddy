@@ -4,8 +4,9 @@ import { CodeBuddyAdapter, failureCode, httpErrorCode } from '../src/adapter.js'
 import type { CodeBuddyConnectionOptions } from '../src/adapter.js'
 import type { CodeBuddySession } from '../src/session.js'
 import { NotLoggedInError } from '../src/session.js'
-import { REQUEST_TIMEOUT_MS } from '../src/constants.js'
+import { CHANNEL_REJECTION_CODE, REQUEST_TIMEOUT_MS, TRANSIENT_UPSTREAM_CODE } from '../src/constants.js'
 import type { CodeBuddyModel } from '../src/types.js'
+import type { ChannelBlockRecord } from '../src/remote-types.js'
 import { DONE } from '../src/sse.js'
 
 const connection: CodeBuddyConnectionOptions = {
@@ -137,6 +138,13 @@ describe('httpErrorCode', () => {
 
   it('maps quota wording to QUOTA before the 429 branch', () => {
     expect(httpErrorCode(429, 'insufficient quota')).toBe('QUOTA')
+  })
+})
+
+describe('upstream business codes', () => {
+  it('keeps the two 111xx codes distinct', () => {
+    expect(CHANNEL_REJECTION_CODE).toBe(11128)
+    expect(TRANSIENT_UPSTREAM_CODE).toBe(11133)
   })
 })
 
@@ -597,6 +605,28 @@ describe('chat request headers', () => {
     const { calls } = installFetch(() => streamResponse(['data: ' + DONE]))
     await collect(adapter(fakeSession()).stream(genOptions()))
     expect(calls[0].init.headers).not.toHaveProperty('X-Conversation-ID')
+  })
+})
+
+describe('channel block recording', () => {
+  it('records the X-User-Id it sent with the block', async () => {
+    // $DSH_HOME 可能被多个账号共用：没有发出的 uid，记录说不清是谁被拦。
+    const recorded: ChannelBlockRecord[] = []
+    const instance = new CodeBuddyAdapter({
+      session: fakeSession({
+        authHeaders: async () => ({ Authorization: 'Bearer t', 'X-User-Id': 'user-7' }),
+      }),
+      options: () => connection,
+      recordBlock: (record) => { recorded.push(record) },
+    })
+    installFetch(() => errorResponse(400, {
+      code: CHANNEL_REJECTION_CODE,
+      msg: 'Illegal API invocation from an unapproved channel',
+    }))
+
+    await expect(collect(instance.stream(genOptions()))).rejects.toMatchObject({ code: 'CHANNEL_BLOCKED' })
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0]?.sentUserId).toBe('user-7')
   })
 })
 

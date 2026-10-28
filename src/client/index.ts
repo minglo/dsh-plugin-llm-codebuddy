@@ -15,7 +15,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import { TYPERT_REMOTE } from '../remote-descriptors.js'
 import { PACKAGE_NAME, PLUGIN_NAME } from '../constants.js'
-import type { CodeBuddyModelsResult, CheckinResultView, CheckinStatusView, LoginPoll, LoginStart, SettingsView, StatusView, UsageResult } from '../remote-types.js'
+import type { CodeBuddyModelsResult, ChannelHealthView, CheckinResultView, CheckinStatusView, LoginPoll, LoginStart, ProbeResultView, SettingsView, StatusView, UsageResult } from '../remote-types.js'
 import { en, zh, type LocaleKey } from './locales.js'
 import { CodeBuddyTab, type CodeBuddyTabInjected } from './CodeBuddyTab.jsx'
 import { UsageIndicator, type UsageIndicatorInjected } from './UsageIndicator.jsx'
@@ -50,6 +50,10 @@ interface CodeBuddyRemote {
   checkinStatus(): Promise<RemoteResult<CheckinStatusView>>
   /** 执行今日签到。 */
   checkin(): Promise<RemoteResult<CheckinResultView>>
+  /** 渠道自检的历史读数。**只读盘、零外呼**——首屏显示上次结论靠它。 */
+  channelHealth(): Promise<RemoteResult<ChannelHealthView>>
+  /** 跑一次三发渠道自检。会消耗极少量额度，只在用户点击时调用。 */
+  probe(): Promise<RemoteResult<ProbeResultView>>
 }
 
 export const NS = 'settings.codebuddy'

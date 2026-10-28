@@ -132,3 +132,89 @@ describe('failure advice', () => {
       .rejects.toMatchObject({ code: 'INVALID_REQUEST' })
   })
 })
+
+describe('channel rejection classification', () => {
+  const BLOCKED = {
+    code: 11128,
+    msg: 'Illegal API invocation from an unapproved channel',
+    displayMsg: { en: 'Request blocked. Please send it again' },
+    displayTips: { en: 'This call failed channel verification.' },
+  }
+
+  it('classifies 11128 as CHANNEL_BLOCKED, not INVALID_REQUEST', async () => {
+    installFetch(() => errorResponse(400, BLOCKED))
+    await expect(drain(adapterWith(connection.baseURL).stream(genOptions())))
+      .rejects.toMatchObject({ code: 'CHANNEL_BLOCKED' })
+  })
+
+  it('does not retry a channel rejection', async () => {
+    // 11128 是确定性失败：重发只把一次失败拖成几十秒。
+    const calls = installFetch(() => errorResponse(400, BLOCKED))
+    await expect(drain(adapterWith(connection.baseURL).stream(genOptions()))).rejects.toThrow()
+    expect(calls).toHaveLength(1)
+  })
+
+  it('hands the block record to the injected callback', async () => {
+    installFetch(() => errorResponse(400, BLOCKED))
+    const recordBlock = vi.fn()
+    const adapter = new CodeBuddyAdapter({ session: fakeSession(), options: () => connection, recordBlock })
+    const system = `${IDENTITY}\n\nBody.`
+    await expect(drain(adapter.stream(genOptions({ system })))).rejects.toThrow()
+    expect(recordBlock).toHaveBeenCalledTimes(1)
+    expect(recordBlock.mock.calls[0]?.[0]).toMatchObject({
+      endpoint: 'https://copilot.tencent.com/v2',
+      fingerprintGuess: 'identity-sentence',
+      // 指纹与长度必须来自同一份原文：只断 guess 会放过「长度取自另一处」的回归。
+      systemLength: system.length,
+    })
+  })
+
+  it('reads the fingerprint from the loop-built system message', async () => {
+    // 真实对话走这条路径：宿主不发 options.system，system 提示在 messages[0]。
+    // 若只看 options.system，systemLength 恒 0、guess 恒 unknown。
+    installFetch(() => errorResponse(400, BLOCKED))
+    const recordBlock = vi.fn()
+    const adapter = new CodeBuddyAdapter({ session: fakeSession(), options: () => connection, recordBlock })
+    await expect(drain(adapter.stream(genOptions({
+      messages: [{ role: 'system', content: [{ type: 'text', text: `${IDENTITY}\n\nBody.` }] }],
+    })))).rejects.toThrow()
+    expect(recordBlock.mock.calls[0]?.[0]).toMatchObject({
+      fingerprintGuess: 'identity-sentence',
+    })
+    expect(recordBlock.mock.calls[0]?.[0]?.systemLength).toBeGreaterThan(0)
+  })
+
+  it('survives a throwing callback', async () => {
+    // 诊断不能反过来弄坏请求结果。
+    installFetch(() => errorResponse(400, BLOCKED))
+    const adapter = new CodeBuddyAdapter({
+      session: fakeSession(), options: () => connection,
+      recordBlock: () => { throw new Error('disk full') },
+    })
+    await expect(drain(adapter.stream(genOptions()))).rejects.toMatchObject({ code: 'CHANNEL_BLOCKED' })
+  })
+
+  it('does not let a throwing warn replace the CHANNEL_BLOCKED error', async () => {
+    // recordBlock 失败后的 warn 也是注入的：它再抛错，不能把分类结果换掉。
+    installFetch(() => errorResponse(400, BLOCKED))
+    const adapter = new CodeBuddyAdapter({
+      session: fakeSession(), options: () => connection,
+      recordBlock: () => { throw new Error('disk full') },
+      warn: () => { throw new Error('logger down') },
+    })
+    await expect(drain(adapter.stream(genOptions()))).rejects.toMatchObject({ code: 'CHANNEL_BLOCKED' })
+  })
+
+  it('leaves other 400s as INVALID_REQUEST', async () => {
+    installFetch(() => errorResponse(400, { code: 1, msg: 'bad parameter' }))
+    await expect(drain(adapterWith(connection.baseURL).stream(genOptions())))
+      .rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+  })
+
+  it('does not misclassify a 400 that merely mentions the channel wording', async () => {
+    // Review Focus 第 5 条：按 code 判，不按文案判——文案会被改。
+    installFetch(() => errorResponse(400, { code: 1, msg: 'Illegal API invocation from an unapproved channel' }))
+    await expect(drain(adapterWith(connection.baseURL).stream(genOptions())))
+      .rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+  })
+})

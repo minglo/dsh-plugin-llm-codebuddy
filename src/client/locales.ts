@@ -76,6 +76,39 @@ export const zh = {
   searchOff: '未接管搜索',
   searchBlocked: '接管未生效',
   searchBadgeHint: '当前 web_search / web_fetch 实际使用的后端。开关为「意图」，此徽标为「效果」：已登录且接管成功时才显示生效中。',
+  // 渠道自检行。判定句逐字取自设计文档 §5「用户看到的一句话」：那是用户点下去
+  // 之后唯一的解释，不能因为这里图省事改成更顺口的说法——两种说法并存时，
+  // 用户报障引用的句子和我们手里依据的句子就对不上了。
+  probeTitle: '渠道自检',
+  // 点下去之前就要知道会花额度：文件里没有这一句，用户会以为是纯本地检测。
+  probeDesc: '用三个最小请求分辨「请求头不合规」与「提示词指纹被拦」。会消耗极少量额度。',
+  probeRun: '运行自检',
+  probeRunning: '检测中…',
+  /** 未知 verdict 的兜底：旧客户端遇到新主机下发的结论，不把键名或英文枚举打上屏。 */
+  probeUnknown: '自检返回了本版本无法识别的结论，请更新插件。',
+  /** 自检调用本身失败（主机拒绝、会话已释放）——与 verdict 是两回事。 */
+  probeFailed: '自检没有完成，请重试。',
+  probeLastRun: '上次自检',
+  probeLastBlock: '上次真实拦截',
+  /** 上次真实拦截的指纹位置：闭集三值，映射成可读文案，不上屏原始标识符。 */
+  probeFingerprintIdentity: '指纹位于系统提示开头的身份声明',
+  probeFingerprintAnywhere: '指纹出现在系统提示的其他位置',
+  probeFingerprintUnknown: '未能定位指纹',
+  probeNever: '无记录',
+  probeHealthy: '通道正常：指纹规则仍在，当前中和有效',
+  probeRuleGone: '上游已不再按已知指纹拦截；中和规则可考虑简化',
+  probeBroken: '中和失效：上游改了匹配方式，需要更新插件',
+  probeInconsistent: '结果自相矛盾（B 放行而 C 被拦），按上游灰度对待',
+  // {stage}/{status} 由卡片按探针实测值填入：段名与状态码是复核判定唯一的证据。
+  probeStageFailed: '自检没跑完：第 {stage} 步返回了 HTTP {status}',
+  probeRejected: '请求头/客户端身份不合规，与提示词无关',
+  probeAuth: '凭据失效，请重新登录',
+  probeRateLimited: '频率受限，稍后再试',
+  probeQuota: '额度用尽',
+  // 「未分类失败」只对上游 500 成立；空目录早退时根本没有上游请求，同一句就成谎话。
+  // 改成两种情形都为真的说法：检查没能得出结论。
+  probeUnavailable: '自检没能得出结论',
+  probeUnreachable: '连不上网关',
   // 模型标签：内联行只放一个倍率（current 优先），其余进悬停气泡。这五个键
   // 就是 ModelLabel 气泡的全部自有文案——缺了任何一个，t() 都会把键名原样上屏。
   rateLabel: '倍率',
@@ -158,6 +191,35 @@ export const en = {
   searchOff: 'Search not taken over',
   searchBlocked: 'Takeover not in effect',
   searchBadgeHint: 'The backend web_search / web_fetch actually uses right now. The switch is intent; this badge is effect — "active" appears only when signed in and the takeover succeeded.',
+  // Channel check row. Verdict sentences mirror design spec §5 ("one sentence the
+  // user sees") — the Chinese is the source text; these are its English counterparts.
+  probeTitle: 'Channel check',
+  probeDesc: 'Three tiny requests tell a rejected client identity apart from a blocked prompt fingerprint. Uses a very small amount of your allowance.',
+  probeRun: 'Run check',
+  probeRunning: 'Checking…',
+  probeUnknown: 'The check returned a verdict this version does not recognise. Please update the plugin.',
+  probeFailed: 'The check did not finish. Please try again.',
+  probeLastRun: 'Last check',
+  probeLastBlock: 'Last real block',
+  /** Where the known fingerprint sat in the blocked request's system prompt. */
+  probeFingerprintIdentity: 'Fingerprint at the opening identity sentence',
+  probeFingerprintAnywhere: 'Fingerprint elsewhere in the system prompt',
+  probeFingerprintUnknown: 'Fingerprint location unknown',
+  probeNever: 'No record',
+  probeHealthy: 'Channel healthy: the fingerprint rule is still in place and the current neutralization works',
+  probeRuleGone: 'Upstream no longer blocks the known fingerprint; the neutralization rule can be simplified',
+  probeBroken: 'Neutralization broken: upstream changed how it matches, so the plugin needs an update',
+  probeInconsistent: 'Contradictory result (B passed while C was blocked); treat it as an upstream gradual rollout',
+  // {stage}/{status} are filled in by the card from the probe's own observations.
+  probeStageFailed: 'The check did not finish: step {stage} returned HTTP {status}',
+  probeRejected: 'The request headers/client identity are not accepted, independent of the prompt',
+  probeAuth: 'Credentials are no longer valid; please sign in again',
+  probeRateLimited: 'Rate limited; try again later',
+  probeQuota: 'Out of credits',
+  // "Unclassified upstream failure" was false when the empty-catalog path returned
+  // before any request; this wording is true for both cases: no verdict was produced.
+  probeUnavailable: 'The check could not produce a verdict',
+  probeUnreachable: 'Cannot reach the gateway',
   // Composer model label: the inline row carries one rate (current first); the
   // rest lives in the hover tooltip. These five keys are all of ModelLabel's copy.
   rateLabel: 'Rate',
