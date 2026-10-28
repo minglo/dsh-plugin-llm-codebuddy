@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ESTABLISHED_FINGERPRINT, guessFingerprint, identitySentenceRegExp, isCodeBuddyEndpoint, rewriteHarnessIdentity } from '../src/channel-fingerprint.js'
+import { ESTABLISHED_FINGERPRINT, FILE_REFERENCE_FINGERPRINT, guessFingerprint, identitySentenceRegExp, isCodeBuddyEndpoint, rewriteHarnessIdentity } from '../src/channel-fingerprint.js'
 
 // 上游按「渠道校验」核对调用方：提示里带 harness 产品名就一律拒收
 // （HTTP 400 · code=11128 · "Illegal API invocation from an unapproved channel"）。
@@ -63,6 +63,55 @@ describe('rewriteHarnessIdentity', () => {
     // 上游只对开头那句整句比对，所以不在开头时不必补逗号；但产品名照样要中和。
     const text = 'Intro.\n\nYou are an AI agent powered by DeepSeek Harness.'
     expect(rewriteHarnessIdentity(text)).toBe('Intro.\n\nYou are an AI agent powered by the harness.')
+  })
+})
+
+describe('the @ path-reference fingerprint', () => {
+  // 2026-10-29 实测：`@deepseek-ai/dsh-file-reference` 贡献进系统提示的那句
+  // 「Tokens prefixed with @ are paths the user explicitly referenced.」正是上游
+  // 第二条渠道判据。它与产品名无关，所以旧的「补逗号 + 产品名代称」两条规则都
+  // 盖不到它——真实请求照旧 400/11128，而自检三发全过。
+  const BODY = 'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.'
+
+  it('is exactly the sentence file-reference injects', () => {
+    expect(FILE_REFERENCE_FINGERPRINT).toBe('Tokens prefixed with @ are paths the user explicitly referenced.')
+  })
+
+  it('rewords it in place and leaves the rest of the paragraph byte-identical', () => {
+    // 只动 `prefixed with` → `starting with`：模型读到的意思不变，上游那串长字面量
+    // 的开头被破坏。测试同时钉住「其余文字一个字都不动」。
+    expect(rewriteHarnessIdentity(BODY)).toBe(
+      BODY.replace('Tokens prefixed with @ are paths the user explicitly referenced.', 'Tokens starting with @ are paths the user explicitly referenced.'),
+    )
+  })
+
+  it('removes the exact window that upstream rejected', () => {
+    // 二分定位时确实被拒的是这段（句号后带半句）；改写后它必须不再逐字出现。
+    const rejected = 'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root'
+    expect(rewriteHarnessIdentity(rejected)).not.toContain(rejected)
+  })
+
+  it('works when the sentence sits mid-prompt after the neutralized identity line', () => {
+    const prompt = `${IDENTITY}\n\n${BODY}\n\nMore.`
+    const rewritten = rewriteHarnessIdentity(prompt)
+    expect(rewritten.startsWith('You are an AI agent, powered by DeepSeek Harness.')).toBe(true)
+    expect(rewritten).not.toContain('Tokens prefixed with @')
+    expect(rewritten).toContain('Tokens starting with @')
+  })
+
+  it('matches regardless of case', () => {
+    expect(rewriteHarnessIdentity('tokens prefixed with @ are paths the user explicitly referenced.'))
+      .toBe('tokens starting with @ are paths the user explicitly referenced.')
+  })
+
+  it('is idempotent', () => {
+    const once = rewriteHarnessIdentity(`${IDENTITY}\n\n${BODY}`)
+    expect(rewriteHarnessIdentity(once)).toBe(once)
+  })
+
+  it('leaves a prompt without it byte-identical', () => {
+    const text = 'Trailing slash marks a directory; anything else is a file.'
+    expect(rewriteHarnessIdentity(text)).toBe(text)
   })
 })
 

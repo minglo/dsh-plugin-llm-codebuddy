@@ -109,11 +109,48 @@ function aliasProductName(text: string): string {
 }
 
 /**
+ * 第二类指纹：`@` 路径说明那句。
+ *
+ * 由 `@deepseek-ai/dsh-file-reference` 贡献进系统提示，**与产品名无关**，所以
+ * 补逗号和产品名代称两条规则都盖不到它。
+ *
+ * 2026-10-29 用真实 system 正文二分定位实测确认：把这句原样放进 system（不在开头
+ * 也一样）就 `400 · code=11128`；把 `prefixed with` 改成 `starting with` 立刻
+ * `200`。同一句话改一个词（`explicitly` → `directly`）也不再命中——上游做的是
+ * 长字面量比对，不是语义判断。
+ *
+ * 保留整句作为常量而不是只留一个词：**测试要钉住的就是这段长字面量**，将来上游
+ * 换了匹配点，这里改一处、测试同时变红。
+ */
+export const FILE_REFERENCE_FINGERPRINT = 'Tokens prefixed with @ are paths the user explicitly referenced.'
+
+/**
+ * 等义改写：只把 `prefixed with` 换成 `starting with`。
+ *
+ * 句子对模型的意思不变（仍然是「以 @ 开头的 token 是用户引用过的路径」），但
+ * 上游那串长字面量的开头被破坏，整条匹配失效。幂等：改写后的文本不再命中本规则。
+ * 正则以 `prefixed with` 开头、只换这两个词：句中其余文字（含大小写）逐个保留。
+ */
+const FILE_REFERENCE_PATTERN = /prefixed with @ are paths the user explicitly referenced\./gi
+
+const FILE_REFERENCE_REWRITE = 'starting with @ are paths the user explicitly referenced.'
+
+/**
+ * 破坏 `@` 路径说明那句的字面量。
+ * @param text - 待中和的文本。
+ * @returns 中和后的文本。
+ */
+function rewriteFileReference(text: string): string {
+  return text.replace(FILE_REFERENCE_PATTERN, FILE_REFERENCE_REWRITE)
+}
+
+/**
  * 破坏渠道校验的指纹。
  *
- * 两条规则：
+ * 三条规则：
  *   1. **开头**那句身份声明补一个逗号（上游只认开头的整句比对）；
- *   2. 提示其余位置的产品名换成中性代称（其余指纹都含产品名）。
+ *   2. 提示其余位置的产品名换成中性代称（同族指纹都含产品名）；
+ *   3. `@` 路径说明那句换个等价说法（它与产品名无关，前两条都覆盖不到）。
  *
  * 第 2 条刻意不碰身份声明里的那一份：身份声明是模型唯一知道自己是谁的地方，
  * 把产品名留在那里。幂等：改写后的文本再跑一次不会变。
@@ -122,11 +159,11 @@ function aliasProductName(text: string): string {
  */
 export function rewriteHarnessIdentity(system: string): string {
   const match = IDENTITY_SENTENCE.exec(system)
-  if (match === null) return aliasProductName(system)
+  if (match === null) return rewriteFileReference(aliasProductName(system))
   // 捕获到的可选逗号是「已经补过」的标记，直接丢掉：输出永远只有一个逗号。
   // 末尾句号是第 4 组，原样带回——没有句号的输入也不会被补上一个。
   const identity = `${match[1]},${match[3]}${match[4]}`
-  return identity + aliasProductName(system.slice(match[0].length))
+  return identity + rewriteFileReference(aliasProductName(system.slice(match[0].length)))
 }
 
 /**
