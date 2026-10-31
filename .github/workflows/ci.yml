@@ -73,6 +73,29 @@ jobs:
 
           echo "产物核对通过：$(wc -l < "$RUNNER_TEMP/listing.txt") 个条目"
 
+      # 产物可加载性：上面只核对「文件在不在」，这里核对「装得上、import 得动」。
+      #
+      # 教训来自 tsup → tsdown：`@Remote` 是 TC39 stage-3 装饰器，oxc 只降级老式
+      # `experimentalDecorators`，漏配 Babel 时产物里会原样留着 `@Remote`——
+      # 690 个测试全绿、构建成功、清单齐全，只有 `import` 那一刻是 SyntaxError，
+      # 而测试跑的是 src/，永远踩不到。真实 import 一次是唯一能拦住它的检查。
+      - name: Packed artifact loads
+        run: |
+          mkdir -p "$RUNNER_TEMP/install"
+          cd "$RUNNER_TEMP/install"
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund "$(ls "$RUNNER_TEMP"/pkg/*.tgz)" >/dev/null
+          node --input-type=module -e "
+            const mod = await import('dsh-plugin-llm-codebuddy')
+            const required = ['Config', 'apply', 'inject', 'name', 'resolveConnectionOptions']
+            for (const key of required) {
+              if (!(key in mod)) throw new Error('产物缺少导出：' + key)
+            }
+            if (typeof mod.apply !== 'function') throw new Error('apply 不是函数')
+            console.log('产物可加载：' + required.join(', '))
+          "
+
   # 上面那道只在 Linux 上跑：路径分隔符、BOM 容忍、锁的 rename 重试与权限语义
   # 在 Windows/macOS 上都没有人看过。这里只跑 typecheck + 测试，不重复构建；
   # node 也只测 22（engines 的下界）——两个平台的差异与 node 版本无关，铺开矩阵

@@ -7,7 +7,7 @@
  * 互斥口径的坑，都是口径分裂的后果。
  *
  * 所有取值器都按「有则取、无则兜底」消化：host 与 client 是两个独立产物
- * （tsc / tsup 分别产出），只重建其一就会拿到缺字段的旧 view，裸属性读会抛，
+ * （tsdown 的两次 build 分别产出），只重建其一就会拿到缺字段的旧 view，裸属性读会抛，
  * 让整个面板静默消失。
  */
 import type { UsageView } from '../remote-types.js'

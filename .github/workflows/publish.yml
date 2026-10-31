@@ -38,6 +38,12 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # 门禁在这里显式跑，不用 package.json 的 prepublishOnly：那个钩子里写的是
+      # `npm run verify`，npm publish 会为它再起一个 npm 进程，绕一圈还叠了一层
+      # 包管理器。显式 + --ignore-scripts 更直白，也保证发布前的构建与测试用的
+      # 就是 pnpm 装出来的那棵树。
+      - run: pnpm run verify
+
       # 两种情形应该以「提示 + 跳过」而不是红灯收场：
       #   - 该版本已在 npm 上（重跑，或 tag 被推了两次）；
       #   - 这个包在 npm 上**根本不存在**，即首次发布。npm 不接受给尚不存在的包做
@@ -62,7 +68,7 @@ jobs:
       # trusted publishing（pnpm/pnpm#9812）；npm CLI >= 11.5.1 才会自动检测 OIDC
       # 环境并完成认证与 provenance 生成。
       #
-      # 门禁由 package.json 的 prepublishOnly（typecheck + test + build）承担，
-      # 故此处不再重复显式跑一遍，避免同一个 gate 执行两次。
-      - run: npm publish --provenance --access public
+      # --ignore-scripts：构建与测试已在上面显式跑过，不必让 npm 再触发一遍
+      # prepublishOnly。
+      - run: npm publish --provenance --access public --ignore-scripts
         if: env.skip != 'true'

@@ -14,8 +14,17 @@ export interface CodeBuddyIdentity {
  * 长生命 SSE 不要用它：请用 dsh-timeout 的 deadline()，并在响应头到达后 dispose。
  */
 export function deadlineSignal(signal: AbortSignal | undefined, ms: number = REQUEST_TIMEOUT_MS): AbortSignal {
-  const deadline = AbortSignal.timeout(ms)
-  return signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+  // 不用 AbortSignal.timeout：它绑定 Node 内部定时器，测试的 fake timers 推不动它，
+  // 且 jsdom 环境下该 API 是否来自 window polyfill 随版本漂移（30.1.x 起行为变了）。
+  // setTimeout + AbortController 语义等价（abort reason 同为 TimeoutError），且可控。
+  const controller = new AbortController()
+  const id = setTimeout(() => {
+    controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+  }, ms)
+  const dispose = (): void => { clearTimeout(id) }
+  controller.signal.addEventListener('abort', dispose, { once: true })
+  signal?.addEventListener('abort', dispose, { once: true })
+  return signal === undefined ? controller.signal : AbortSignal.any([signal, controller.signal])
 }
 
 /** 刷新没有产出新 token 的原因。 */
