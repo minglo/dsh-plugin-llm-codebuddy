@@ -38,6 +38,26 @@ class FakeLlm extends Service {
   }
 }
 
+/**
+ * 一个每次写入都失败的 storageDomain 替身。
+ *
+ * 只覆盖 `open`/`table`/`put` 这三个被真实路径用到的成员：健康态写不进去时，
+ * `recordChannelBlock` 必须拒绝，而 `apply()` 注入的 `.catch` 把它变成一行日志。
+ */
+class FailingStorageDomain extends Service {
+  static inject: string[] = []
+  constructor(ctx: Context) { super(ctx, 'storageDomain') }
+  async open(): Promise<unknown> {
+    return {
+      table: () => ({
+        get: () => undefined,
+        put: async () => { throw new Error('storage backend down') },
+      }),
+      close: async () => undefined,
+    }
+  }
+}
+
 /** 取 apply() 注册进 llm seam 的那个 adapter（测试单例，每个 ctx 只有一个）。 */
 function registeredAdapter(ctx: Context): {
   config: { recordBlock?: (record: ChannelBlockRecord) => void }
@@ -398,14 +418,10 @@ describe('apply() · channel probe chat base', () => {
  */
 describe('apply() · channel block recording is best-effort', () => {
   it('logs a failed write without making the callback throw', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'cb-record-fail-'))
-    scratchDirs.push(dir)
-    // DSH_HOME 指向一个普通文件：mkdir(recursive) 必然失败，recordChannelBlock 拒绝。
-    const blockedHome = join(dir, 'not-a-directory')
-    writeFileSync(blockedHome, 'x')
-    vi.stubEnv('DSH_HOME', blockedHome)
-
     const composed = await compose({ loggedIn: true, webSearch: false })
+    // 挂一个必然失败的存储后端：`blocks` 的每一次 put 都拒绝。
+    // 健康态是诊断旁路，写不进去只能记一行日志，不能让适配器的回调抛错。
+    await composed.ctx.plugin(FailingStorageDomain)
     const warn = vi.spyOn(composed.ctx.logger, 'warn').mockImplementation(() => {})
     apply(composed.ctx, composed.config as never)
 

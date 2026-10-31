@@ -203,7 +203,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     // **不 await**：写盘失败（权限、磁盘满）绝不能让一次请求的结果变成错误，
     // 诊断是旁路，请求本身才是主线。
     recordBlock: (record) => {
-      void recordChannelBlock(record).catch((error: unknown) => {
+      void recordChannelBlock(ctx, record).catch((error: unknown) => {
         ctx.logger.warn(`${PACKAGE_NAME}: recording a channel block failed: ${String(error)}`)
       })
     },
@@ -257,8 +257,10 @@ export function apply(ctx: Context, config: Config = {}): void {
     // 探针与渠道指纹判定都按**聊天面**地址：gatewayRoot 是给 /agenttool 的，
     // 刻意去掉了 /v2，拿它拼 /chat/completions 会打错地方。
     chatBaseURL: () => resolved.baseURL,
-    // 探针结果写盘失败只记日志：结论已经算出来了，不能因为旁路文件丢了。
+    // 探针结果落盘失败只记日志：结论已经算出来了，不能因为旁路记录丢了。
     warn: (message) => { ctx.logger.warn(message) },
+    // 健康态的读写目标。两处共用同一个 ctx，因此共用同一份 storage domain。
+    health: ctx,
     searchBackend: async () => {
       await webSync.resync()
       return webSync.backendState()

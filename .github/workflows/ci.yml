@@ -96,10 +96,13 @@ jobs:
             console.log('产物可加载：' + required.join(', '))
           "
 
-  # 上面那道只在 Linux 上跑：路径分隔符、BOM 容忍、锁的 rename 重试与权限语义
-  # 在 Windows/macOS 上都没有人看过。这里只跑 typecheck + 测试，不重复构建；
-  # node 也只测 22（engines 的下界）——两个平台的差异与 node 版本无关，铺开矩阵
-  # 只是多烧一遍 runner。pack smoke 用 tar/grep，留在 ubuntu job 里，这里不换 shell。
+  # 上面那道只在 Linux 上跑：路径分隔符、BOM 容忍与权限语义在 Windows/macOS 上
+  # 都没有人看过。这里只跑 typecheck + 测试，不重复构建；node 也只测 22（engines
+  # 的下界）——两个平台的差异与 node 版本无关，铺开矩阵只是多烧一遍 runner。
+  # pack smoke 用 tar/grep，留在 ubuntu job 里，这里不换 shell。
+  #
+  # 磁盘语义（原子替换、rename、目录 fsync）自换用 DSH storage 层起不再由本插件
+  # 拥有，这道 job 现存的理由是「本插件自己的路径与编码处理在两个平台上跑得通」。
   verify-cross-platform:
     runs-on: ${{ matrix.os }}
     strategy:

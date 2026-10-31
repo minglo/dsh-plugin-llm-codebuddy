@@ -83,6 +83,13 @@ export interface CodeBuddyRemoteOptions {
    * 返回计算结果，只是没人收到这条 warn。
    */
   warn?: (message: string) => void
+  /**
+   * 健康态的存储目标。缺省时探针不落盘、`channelHealth()` 返回空记录。
+   *
+   * 与 `warn` 同款取舍：独立实例化（测试、headless）不该被存储能力绑死，
+   * 而 `apply()` 总是注入。
+   */
+  health?: Context
 }
 
 export class CodeBuddyRemoteService extends TypertRemoteService {
@@ -260,7 +267,10 @@ export class CodeBuddyRemoteService extends TypertRemoteService {
   @Remote
   async channelHealth(): Promise<ChannelHealthView> {
     const chatBase = this.options.chatBaseURL?.() ?? CODEBUDDY_CHAT_BASE
-    const stored = await readChannelHealth()
+    // 没注入存储目标时按「还没有记录」处理：独立实例化的服务不该凭空 invent
+    // 一份历史，也不该因为存储缺席就抛错。
+    const health = this.options.health
+    const stored = health === undefined ? { recentBlocks: [] } : await readChannelHealth(health)
     // 读盘刻意宽松、wire 必须严格：坏记录当它不存在，别让整张卡片陪葬。
     const lastProbe = isDisplayableProbe(stored.lastProbe) ? stored.lastProbe : undefined
     const lastBlock = isDisplayableBlock(stored.lastBlock) ? stored.lastBlock : undefined
@@ -292,6 +302,7 @@ export class CodeBuddyRemoteService extends TypertRemoteService {
     return probeChannel({
       session: this.options.session,
       baseURL: this.options.chatBaseURL?.() ?? CODEBUDDY_CHAT_BASE,
+      ...this.options.health === undefined ? {} : { health: this.options.health },
       ...this.options.warn === undefined ? {} : { warn: this.options.warn },
     })
   }

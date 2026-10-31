@@ -734,8 +734,9 @@ describe('channelHealth / probe', () => {
 
   it('channelHealth reads stored health without any outbound request', async () => {
     scratchHome()
+    const ctx = await setupScratch()
     const { recordChannelBlock } = await import('../src/channel-health.js')
-    await recordChannelBlock({
+    await recordChannelBlock(ctx as never, {
       at: 2,
       endpoint: chatBase,
       systemLength: 10,
@@ -743,13 +744,29 @@ describe('channelHealth / probe', () => {
     })
     // 卡片的第一次读取必须零外呼：任何请求都会在这里直接抛错。
     vi.stubGlobal('fetch', () => { throw new Error('channelHealth must not touch the network') })
-    const ctx = await setupScratch()
-    const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session, chatBaseURL: () => chatBase })
+    const svc = new CodeBuddyRemoteService(ctx, {
+      session: sessionStub().session,
+      chatBaseURL: () => chatBase,
+      health: ctx,
+    })
 
     await expect(svc.channelHealth()).resolves.toEqual({
       applicable: true,
       lastBlock: { at: 2, fingerprintGuess: 'identity-sentence' },
     })
+  })
+
+  it('channelHealth reports nothing when no health target is injected', async () => {
+    // 独立实例化（headless / 只看目录的调用方）不该因为缺存储就抛错，
+    // 也不该凭空发明一份历史。
+    scratchHome()
+    const ctx = await setupScratch()
+    const svc = new CodeBuddyRemoteService(ctx, {
+      session: sessionStub().session,
+      chatBaseURL: () => chatBase,
+    })
+
+    await expect(svc.channelHealth()).resolves.toEqual({ applicable: true })
   })
 
   it('channelHealth marks a non-CodeBuddy endpoint as not applicable', async () => {
@@ -764,7 +781,12 @@ describe('channelHealth / probe', () => {
     await expect(svc.channelHealth()).resolves.toEqual({ applicable: false })
   })
 
-  /** 直接写盘，模拟手改 / 版本偏斜 / 旧宿主留下的记录。 */
+  /**
+   * 直接写旧格式文件，模拟版本偏斜 / 旧宿主留下的记录。
+   *
+   * 新存储是 schema 校验过的，写不进「形状错但仍然合法」的记录；而这条路径
+   * 正是 wire 层要防的：一份旧文件不该让卡片整张消失。
+   */
   function writeHealth(home: string, value: unknown): void {
     writeFileSync(join(home, 'codebuddy-channel-health.json'), JSON.stringify(value))
   }
@@ -779,7 +801,7 @@ describe('channelHealth / probe', () => {
       lastBlock: { at: 2, requestId: 'r2', endpoint: chatBase, systemLength: 10, fingerprintGuess: 'identity-sentence' },
     })
     const ctx = await setupScratch()
-    const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session, chatBaseURL: () => chatBase })
+    const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session, chatBaseURL: () => chatBase, health: ctx })
 
     await expect(svc.channelHealth()).resolves.toEqual({
       applicable: true,
@@ -794,7 +816,7 @@ describe('channelHealth / probe', () => {
       lastProbe: { verdict: 'healthy', at: 1, model: 'm1', stages: [{}] },
     })
     const ctx = await setupScratch()
-    const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session, chatBaseURL: () => chatBase })
+    const svc = new CodeBuddyRemoteService(ctx, { session: sessionStub().session, chatBaseURL: () => chatBase, health: ctx })
 
     await expect(svc.channelHealth()).resolves.toEqual({ applicable: true })
   })

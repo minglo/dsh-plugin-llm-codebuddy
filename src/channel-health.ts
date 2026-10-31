@@ -1,174 +1,51 @@
-// 渠道健康态：`$DSH_HOME/codebuddy-channel-health.json` 的读写 + 三发诊断探针。
+// 渠道健康态：三发诊断探针 + 健康态的读写门面。
 //
-// 两件事放一起是因为它们共用同一份落盘形状；但依赖方向是单向的：
-// 适配器只**类型** import `ChannelBlockRecord`（见 remote-types.ts），真正写盘的
-// `recordChannelBlock` 由 index.ts 注入；探针、网络与判定表不会跟着进请求路径。
+// 落盘本身在 `channel-health-store.ts`（DSH storage domain）；本文件只负责
+// 「记什么、怎么判」。依赖方向仍是单向的：适配器只**类型** import
+// `ChannelBlockRecord`（见 remote-types.ts），真正写盘的 `recordChannelBlock`
+// 由 index.ts 注入；探针、网络与判定表不会跟着进请求路径。
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
-import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
-import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
+import type { Context } from '@deepseek-ai/cordis'
 import { isQuotaExceededError } from '@deepseek-ai/dsh-llm'
 import { deadline, timeoutOf } from '@deepseek-ai/dsh-timeout'
-import { ESTABLISHED_FINGERPRINT, FINGERPRINT_GUESSES, rewriteHarnessIdentity } from './channel-fingerprint.js'
+import { ESTABLISHED_FINGERPRINT, rewriteHarnessIdentity } from './channel-fingerprint.js'
+import { channelHealthStoreOf, RECENT_BLOCK_LIMIT } from './channel-health-store.js'
+import type { StoredHealth } from './channel-health-store.js'
 import { buildChatHeaders } from './chat-headers.js'
 import { CHANNEL_REJECTION_CODE } from './constants.js'
 import type { ChannelBlockRecord, ChannelVerdict, ProbeResultView, ProbeStage } from './remote-types.js'
 import { resetAtFromText } from './reset-time.js'
 import { NotLoggedInError, type CodeBuddySession } from './session.js'
 
-/** 渠道健康态在 `$DSH_HOME` 下的文件名；拦截记录与探针结果共用这一份。 */
-const CHANNEL_HEALTH_FILENAME = 'codebuddy-channel-health.json'
+// 类型与常量从这里转发：调用方（remote.ts、测试）只认 channel-health 这个入口，
+// 不该为了一次重构改二十处 import。
+export { RECENT_BLOCK_LIMIT } from './channel-health-store.js'
+export type { StoredHealth } from './channel-health-store.js'
 
 /**
- * 落盘后仅供宿主内部使用的健康态。
+ * 每个 Context 一条串行队列，保证同一进程内的读-改-写不互相覆盖。
  *
- * 比 `ChannelHealthView` 多留了 `recentBlocks` 与完整的 `lastBlock`：请求 id 与
- * endpoint 是用户报障时唯一能复查的证据，但它们也只对宿主有意义，不往浏览器发。
- */
-export interface StoredHealth {
-  lastProbe?: ProbeResultView
-  lastBlock?: ChannelBlockRecord
-  recentBlocks: ChannelBlockRecord[]
-}
-
-/**
- * `recentBlocks` 的上限。够看出「从什么时候开始拦、拦的形状有没有变」，
- * 又不至于让文件无限长——它跟着用户一起进备份，不是日志。
- */
-const RECENT_BLOCK_LIMIT = 20
-
-/**
- * 落盘路径每次现算，不在模块顶层求值：`DSH_HOME` 由 launch environment 注入，
- * 在测试里也会被逐用例改写，模块级常量会把它固化成进程启动时的那个值。
- */
-function channelHealthPath(): string {
-  return dshHomePath(CHANNEL_HEALTH_FILENAME)
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-/**
- * 结构上确实是拦截记录吗？
+ * storage 的 domain 已经保证单次写入不会被交错，但「读出 20 条 → 追加一条 →
+ * 写回」是两次调用，中间可以插进另一个会话的读-改-写——结果就是一方刚追加的
+ * 那条被覆盖。这正是迁移前 `withFileLock` 在防的事，锁没了就得在这一层补回来。
  *
- * 文件是明文的、可被手改的——下游（卡片）拿到一条 `fingerprintGuess: 'garbage'`
- * 会渲染出什么都不确定的文案。宁可当作没这一条。
+ * 只是进程内串行：跨进程（web + cli 同时记）仍会以最后完成者为准，这是
+ * storage 后端的已知限制，见 channel-health-store.ts 的注释。
  */
-function isChannelBlockRecord(value: unknown): value is ChannelBlockRecord {
-  if (!isObject(value)) return false
-  return typeof value.at === 'number'
-    // requestId 是可选的，但「有」的时候必须是字符串：手改成数字的 42 会被
-    // 下游当成 id 去查，而它根本不是任何一次请求的回执。
-    && (value.requestId === undefined || typeof value.requestId === 'string')
-    && typeof value.endpoint === 'string'
-    && typeof value.systemLength === 'number'
-    // 与 remote.ts 的 isDisplayableBlock 共用同一份闭集：两处各列一份，新增
-    // 一个取值时总有一边会漏，漏的那边会把合法记录当成坏数据扔掉。
-    && typeof value.fingerprintGuess === 'string'
-    && (FINGERPRINT_GUESSES as readonly string[]).includes(value.fingerprintGuess)
-}
+const queues = new WeakMap<Context, Promise<unknown>>()
 
-/**
- * 单个阶段观察值的结构复核。
- *
- * `Array.isArray(stages)` 只保证外面是数组：`stages: [null]` 这样的手改内容会
- * 原样穿过守卫，然后在卡片里被当成 ProbeStage 读字段。逐字段查一遍，形状必须
- * 与 remote-descriptors 的 codec 一致（optional 字段缺省合法）。
- */
-function isProbeStageView(value: unknown): value is ProbeStage {
-  if (!isObject(value)) return false
-  return (value.stage === 'A' || value.stage === 'B' || value.stage === 'C')
-    && (value.status === undefined || typeof value.status === 'number')
-    && (value.code === undefined || typeof value.code === 'number')
-    && (value.requestId === undefined || typeof value.requestId === 'string')
-    && (value.quota === undefined || typeof value.quota === 'boolean')
-}
-
-/**
- * 结构上确实是一次探针结果吗？
- *
- * `verdict` 只查「是不是字符串」，不逐条比对枚举：客户端本来就必须容忍一个
- * 它不认识的 verdict（新宿主给旧浏览器发新结论），读盘这侧若枚举化，等于给磁盘
- * 内容加上一个只能随枚举一起改的隐式版本约束。
- */
-function isProbeResultView(value: unknown): value is ProbeResultView {
-  return isObject(value)
-    && typeof value.verdict === 'string'
-    && typeof value.at === 'number'
-    && typeof value.model === 'string'
-    && Array.isArray(value.stages)
-    && value.stages.every(isProbeStageView)
-}
-
-/**
- * 读盘。**刻意宽松**：文件缺失、JSON 损坏、字段被手改成别的形状，一律当作
- * 「还没有记录」，而不是抛错——卡片该显示「没有」，不该因为一份旁路数据读不出来
- * 就整张消失。
- *
- * 也**不检查文件权限**：权限被人为放宽的文件照样要读得出来，收紧发生在下一次
- * 写入（`writeFileAtomic` 会用新 inode 的 0600 覆盖掉旧 mode）。
- */
-async function readUnlocked(path: string): Promise<StoredHealth> {
-  let raw: string
-  try {
-    raw = await readFile(path, 'utf8')
-  } catch {
-    return { recentBlocks: [] }
-  }
-  // 我们自己写的是无 BOM 的 UTF-8，但 Windows 编辑器给 UTF-8 加 BOM 是常态：
-  // `JSON.parse` 见到开头的 U+FEFF 会直接抛错，整份记录于是落进下面的「无记录」
-  // 分支——宽容的代价是历史被静默清空，而这段历史正是用户报障时唯一的证据。
-  // 只剥开头这一个字符：JSON 字符串正文里的 U+FEFF 是合法内容，不能动。
-  //
-  // UTF-16（PowerShell 5.1 的 `Out-File` 默认）按 utf8 读是乱码，同样解析失败、
-  // 同样降级为「无记录」。这里**刻意不做 BOM 嗅探与转码**：写入端固定 utf8，
-  // 读侧只承诺读回自己写出的文件；手改成 UTF-16 的降级是有意划下的边界，
-  // 不是漏掉的分支。
-  if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1)
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return { recentBlocks: [] }
-  }
-  if (!isObject(parsed)) return { recentBlocks: [] }
-
-  const stored: StoredHealth = {
-    recentBlocks: Array.isArray(parsed.recentBlocks)
-      ? parsed.recentBlocks.filter(isChannelBlockRecord)
-      : [],
-  }
-  if (isChannelBlockRecord(parsed.lastBlock)) stored.lastBlock = parsed.lastBlock
-  if (isProbeResultView(parsed.lastProbe)) stored.lastProbe = parsed.lastProbe
-  return stored
-}
-
-/**
- * 一次加锁的 read-modify-write。
- *
- * 锁不是可选的：同一进程里多个会话都会记拦截，各自「读→改→写」会把对方刚追加的
- * 那条覆盖掉——丢的正好是唯一的证据。读者不需要锁：`writeFileAtomic` 用 rename
- * 提交，读到的要么是旧内容要么是新内容，不会是半个文件。
- */
-async function mutateHealth(change: (current: StoredHealth) => StoredHealth): Promise<void> {
-  const path = channelHealthPath()
-  // 父目录先建：锁是在 `<file>.lock` 上 `wx` 创建的，它不会替我们建目录——只有锁内的
-  // `writeFileAtomic` 会，而那时已经晚了。$DSH_HOME 尚不存在时（全新安装、测试、被清空
-  // 过），少了这一句，第一条真实拦截就以 ENOENT 丢掉，而它正是这个功能存在的理由。
-  // 0700：这里放的是诊断数据，没有理由让同机其它用户列目录。
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
-  await withFileLock(path, async () => {
-    const next = change(await readUnlocked(path))
-    // 0600：文件里是 endpoint 与请求 id，虽不含凭据，也没有理由让同机其它用户读。
-    await writeFileAtomic(path, JSON.stringify(next, null, 2), { mode: 0o600 })
-  })
+function serialize<T>(ctx: Context, task: () => Promise<T>): Promise<T> {
+  const tail = queues.get(ctx) ?? Promise.resolve()
+  const next = tail.then(task, task)
+  // 队列尾巴永远是一条已结算的 promise：失败由调用方各自观察，不能让它
+  // 拒绝后把后续所有写入一起拖死（unhandled rejection 也会因此消失）。
+  queues.set(ctx, next.catch(() => undefined))
+  return next
 }
 
 /** 读当前健康态；读不到就是空记录。 */
-export async function readChannelHealth(): Promise<StoredHealth> {
-  return readUnlocked(channelHealthPath())
+export async function readChannelHealth(ctx: Context): Promise<StoredHealth> {
+  return (await channelHealthStoreOf(ctx)).read()
 }
 
 /**
@@ -177,12 +54,12 @@ export async function readChannelHealth(): Promise<StoredHealth> {
  * `lastBlock` 与 `recentBlocks` 一起更新：前者给卡片显示「上次拦截」，
  * 后者留一段历史，用来判断规则是刚开始收紧还是早就如此。
  */
-export async function recordChannelBlock(record: ChannelBlockRecord): Promise<void> {
-  await mutateHealth((current) => ({
-    ...current,
-    lastBlock: record,
-    recentBlocks: [...current.recentBlocks, record].slice(-RECENT_BLOCK_LIMIT),
-  }))
+export async function recordChannelBlock(ctx: Context, record: ChannelBlockRecord): Promise<void> {
+  await serialize(ctx, async () => {
+    const store = await channelHealthStoreOf(ctx)
+    const current = store.read().recentBlocks
+    await store.writeBlocks({ recentBlocks: [...current, record].slice(-RECENT_BLOCK_LIMIT) })
+  })
 }
 
 /**
@@ -192,8 +69,8 @@ export async function recordChannelBlock(record: ChannelBlockRecord): Promise<vo
  * 「现在会不会被拦」，不是用户真实请求的现场；混进去会让卡片把一次主动探测
  * 说成「你的请求被拒了」。所以这里连 `lastBlock` / `recentBlocks` 都不碰。
  */
-export async function saveProbeResult(result: ProbeResultView): Promise<void> {
-  await mutateHealth((current) => ({ ...current, lastProbe: result }))
+export async function saveProbeResult(ctx: Context, result: ProbeResultView): Promise<void> {
+  await (await channelHealthStoreOf(ctx)).writeProbe(result)
 }
 
 /**
@@ -223,10 +100,15 @@ interface ProbeDeps {
   session: CodeBuddySession
   baseURL: string
   /**
+   * 健康态的写入目标。缺省时**不落盘**：探针在 headless / 测试里同样要能跑完，
+   * 只是结论只存在于返回值里。
+   */
+  health?: Context
+  /**
    * 诊断旁路的告警出口（宿主日志）。
    *
    * 只用于「结果算出来了但没写进盘」这类不该改变请求结果的问题：探针已经花掉
-   * 三次请求并得出真实结论，不能因为一份旁路文件写不进去就把结论丢掉。
+   * 三次请求并得出真实结论，不能因为一份旁路记录写不进去就把结论丢掉。
    */
   warn?: (message: string) => void
 }
@@ -496,12 +378,15 @@ async function runProbe(deps: ProbeDeps, signal?: AbortSignal): Promise<ProbeRes
     model,
     stages,
   }
-  // 落盘是旁路：三次请求已经花掉、结论已经算出来，写盘失败（磁盘满、权限、
-  // $DSH_HOME 被换成文件）只该进 warn，不该让 probe() 拒绝并丢掉这次读数。
-  try {
-    await saveProbeResult(result)
-  } catch (error: unknown) {
-    deps.warn?.(`channel probe: saving the result failed: ${String(error)}`)
+  // 落盘是旁路：三次请求已经花掉、结论已经算出来，写盘失败（存储被隔离、
+  // 后端不可用）只该进 warn，不该让 probe() 拒绝并丢掉这次读数。
+  const health = deps.health
+  if (health !== undefined) {
+    try {
+      await saveProbeResult(health, result)
+    } catch (error: unknown) {
+      deps.warn?.(`channel probe: saving the result failed: ${String(error)}`)
+    }
   }
   return result
 }

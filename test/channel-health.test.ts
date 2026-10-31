@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -7,38 +7,87 @@ import type { CodeBuddySession } from '../src/session.js'
 import type { CodeBuddyModel } from '../src/types.js'
 
 /**
- * POSIX 权限位在 Windows 上表达不出来：可写文件的 `statSync().mode` 恒在 0o666
- * 附近（不随 umask 或我们的 0600 变化），`chmodSync` 也只切换只读位，造不出
- * 「被放宽成 0644」这种状态。所以下面四条权限断言在 win32 上不是失败，而是
- * **测不到东西**——用 `skipIf` 让它们继续在 Linux/macOS 上跑。不要删掉或改成
- * 恒真：它们锁的是「写严格」这条真实约束，只在 Windows 上无意义。
+ * 健康态的测试只测**本插件自己的东西**：记什么、怎么组装、坏数据怎么办。
+ *
+ * 落盘本身（原子替换、目录 fsync、权限位、Windows rename 语义）现在属于 DSH 的
+ * storage 层，由那边的 contract 套件负责。这里用一个内存 store 走**真实的调用
+ * 路径**——`recordChannelBlock` / `readChannelHealth` / `probeChannel` 一行不改，
+ * 只把最底层的介质换掉。
+ *
+ * 之前那四条权限 / 目录 / BOM 用例随实现一起移除了：它们测的是介质行为，
+ * 而我们不再拥有介质。旧文件迁移另有专门用例。
  */
-const isWindows = process.platform === 'win32'
 
-// 每个用例一个全新 home：落盘路径由 DSH_HOME 决定，测试之间不共享状态。
+/**
+ * 用一个内存 store 冒充 storage domain。
+ *
+ * `ctx.get('storageDomain')` 返回 undefined 时 `openChannelHealthStore` 本来就会
+ * 退到内存实现，所以这里连假 facility 都不需要——一个只有 `get` 的 ctx 就够。
+ */
+function memoryCtx(): unknown {
+  return { get: () => undefined }
+}
+
+/** 之前的用例靠 `vi.resetModules()` 拿新模块；store 是每 Context 一份，无需重置。 */
+let ctx: never
+
+// 每个用例一个全新 home：旧文件迁移按 DSH_HOME 定位。
 let home = ''
-// 临时目录逐用例登记，afterEach 里尽力删除：Linux 靠 tmpfs 回收，Windows 上
-// 不删就会一直累积（mkdtemp 建在 %TEMP% 下，没有进程退出即清空的保证）。
 const scratchDirs: string[] = []
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'cb-health-'))
   scratchDirs.push(home)
   vi.stubEnv('DSH_HOME', home)
-  vi.resetModules() // 单飞状态是模块级的，模块必须在每个用例重新求值
+  ctx = memoryCtx() as never
 })
 afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllEnvs()
   vi.unstubAllGlobals()
-  // force: true 让「用例自己删过」或「从未建出文件」也不算失败；异常吞掉纯属
-  // best-effort——清理失败不该把一条真实断言的结果改写成红。
   for (const dir of scratchDirs.splice(0)) {
     try { rmSync(dir, { recursive: true, force: true }) } catch { /* best-effort cleanup */ }
   }
 })
 
-/** 落盘文件在临时 home 里的位置。 */
-const healthFile = () => join(home, 'codebuddy-channel-health.json')
+/**
+ * 一个会写失败的假 storageDomain。
+ *
+ * 走**真实**的 `openChannelHealthStore` 路径（facility.open → domain.table →
+ * put），只把介质换成两个 Map，并让 `blocks` 的下一次写入抛错。用来验证
+ * 「一次写失败不会把后续写入一起拖死」——这条属于本插件的队列逻辑，
+ * 不是 storage 层的职责。
+ * @param shouldFail - 每次 put 前问一次「这次失败吗」。
+ * @returns 该 ctx 与它背后累计下来的记录。
+ */
+function flakyFacility(shouldFail: () => boolean): { ctx: never } {
+  const tables = new Map<string, Map<string, unknown>>()
+  const tableOf = (name: string) => {
+    const existing = tables.get(name)
+    if (existing !== undefined) return existing
+    const created = new Map<string, unknown>()
+    tables.set(name, created)
+    return created
+  }
+  const facility = {
+    open: async () => ({
+      table: (name: string) => {
+        const rows = tableOf(name)
+        return {
+          get: (key: string) => rows.get(key),
+          put: async (key: string, value: unknown) => {
+            if (shouldFail()) throw new Error('backend down')
+            rows.set(key, value)
+          },
+        }
+      },
+      close: async () => undefined,
+    }),
+  }
+  return { ctx: { get: () => facility } as never }
+}
+
+/** 旧版健康态文件在临时 home 里的位置。 */
+const legacyFile = () => join(home, 'codebuddy-channel-health.json')
 
 const block = (at: number) => ({
   at,
@@ -48,77 +97,22 @@ const block = (at: number) => ({
   fingerprintGuess: 'identity-sentence' as const,
 })
 
-describe('readChannelHealth', () => {
-  it('returns an empty record when the file is absent', async () => {
-    const { readChannelHealth } = await import('../src/channel-health.js')
-    expect(await readChannelHealth()).toEqual({ recentBlocks: [] })
-  })
-
-  it('returns an empty record when the file is corrupt', async () => {
-    writeFileSync(healthFile(), '{not json')
-    const { readChannelHealth } = await import('../src/channel-health.js')
-    expect(await readChannelHealth()).toEqual({ recentBlocks: [] })
-  })
-
-  it('reads a record saved with a leading UTF-8 BOM', async () => {
-    // Windows 编辑器给 UTF-8 加 BOM 是常态。`JSON.parse` 见到开头的 U+FEFF 会抛
-    // 「Unexpected token」，整份记录被当成「无记录」——历史静默消失。读侧必须剥掉
-    // 那一个字符再解析，否则这条用例拿到的是 `{ recentBlocks: [] }`。
-    writeFileSync(healthFile(), `\uFEFF${JSON.stringify({ lastBlock: block(9) })}`)
-    const { readChannelHealth } = await import('../src/channel-health.js')
-    expect((await readChannelHealth()).lastBlock).toMatchObject({ at: 9 })
-  })
-
-  it('drops a lastBlock whose fingerprintGuess is outside the closed set', async () => {
-    // JSON 合法但形状错了：下游卡片会按三值闭集渲染，'garbage' 没有对应文案。
-    writeFileSync(healthFile(), JSON.stringify({
-      lastBlock: { at: 1, endpoint: 'e', systemLength: 1, fingerprintGuess: 'garbage' },
-    }))
-    const { readChannelHealth } = await import('../src/channel-health.js')
-    expect((await readChannelHealth()).lastBlock).toBeUndefined()
-  })
-
-  it('drops recentBlocks when it is not an array', async () => {
-    writeFileSync(healthFile(), JSON.stringify({ recentBlocks: 'x' }))
-    const { readChannelHealth } = await import('../src/channel-health.js')
-    expect(await readChannelHealth()).toEqual({ recentBlocks: [] })
-  })
-
-  it('drops a lastProbe whose stage element is not an object', async () => {
-    // Array.isArray 只保证外层是数组；`[null]` 会在卡片里被当成阶段读字段。
-    writeFileSync(healthFile(), JSON.stringify({
-      lastProbe: { verdict: 'healthy', at: 1, model: 'm1', stages: [null] },
-    }))
-    const { readChannelHealth } = await import('../src/channel-health.js')
-    expect((await readChannelHealth()).lastProbe).toBeUndefined()
-  })
-
-  it('drops a lastBlock whose optional requestId is not a string', async () => {
-    // requestId 可选，但「有」的时候只能是字符串：42 不是任何一次请求的回执。
-    writeFileSync(healthFile(), JSON.stringify({
-      lastBlock: { at: 1, requestId: 42, endpoint: 'e', systemLength: 1, fingerprintGuess: 'identity-sentence' },
-    }))
-    const { readChannelHealth } = await import('../src/channel-health.js')
-    expect((await readChannelHealth()).lastBlock).toBeUndefined()
-  })
-})
-
 describe('recordChannelBlock', () => {
   it('writes the block and keeps it as lastBlock', async () => {
     const { recordChannelBlock, readChannelHealth } = await import('../src/channel-health.js')
-    await recordChannelBlock(block(1))
-    const stored = await readChannelHealth()
+    await recordChannelBlock(ctx, block(1))
+    const stored = await readChannelHealth(ctx)
     expect(stored.lastBlock).toMatchObject({ at: 1, requestId: 'r1' })
     expect(stored.recentBlocks).toHaveLength(1)
   })
 
   it('keeps an existing lastProbe when a real block is recorded', async () => {
-    // 写拦截走的是 `{ ...current }` 的读改写；漏掉这个 spread 会在第一次真实拦截
-    // 之后悄悄抹掉探针结论，而卡片仍显示「上次自检」——只是变成了无记录。
+    // 记录拦截与记录探针是两张表：漏掉这一步会在第一次真实拦截之后悄悄抹掉
+    // 探针结论，而卡片仍显示「上次自检」——只是变成了无记录。
     const { recordChannelBlock, saveProbeResult, readChannelHealth } = await import('../src/channel-health.js')
-    await saveProbeResult({ verdict: 'healthy', at: 1, model: 'm1', stages: [] })
-    await recordChannelBlock(block(2))
-    const stored = await readChannelHealth()
+    await saveProbeResult(ctx, { verdict: 'healthy', at: 1, model: 'm1', stages: [] })
+    await recordChannelBlock(ctx, block(2))
+    const stored = await readChannelHealth(ctx)
     expect(stored.lastProbe).toMatchObject({ verdict: 'healthy', at: 1 })
     expect(stored.lastBlock).toMatchObject({ at: 2 })
     expect(stored.recentBlocks).toHaveLength(1)
@@ -126,56 +120,37 @@ describe('recordChannelBlock', () => {
 
   it('keeps only the newest twenty blocks, oldest dropped first', async () => {
     const { recordChannelBlock, readChannelHealth } = await import('../src/channel-health.js')
-    for (let i = 0; i < 25; i++) await recordChannelBlock(block(i))
-    const stored = await readChannelHealth()
+    for (let i = 0; i < 25; i++) await recordChannelBlock(ctx, block(i))
+    const stored = await readChannelHealth(ctx)
     expect(stored.recentBlocks).toHaveLength(20)
     expect(stored.recentBlocks[0]?.at).toBe(5)
     expect(stored.recentBlocks[19]?.at).toBe(24)
+    expect(stored.lastBlock).toMatchObject({ at: 24 })
   })
 
   it('keeps every block when several sessions record at once', async () => {
-    // 锁的作用点：并发的 read-modify-write 在无锁时会互相覆盖，丢掉的正好是证据。
+    // 串行队列的作用点：并发「读→改→写」在无串行化时会互相覆盖，丢掉的正好是
+    // 证据。storage 只保证单次写入不交错，跨两次调用的读-改-写要我们自己排队。
     const { recordChannelBlock, readChannelHealth } = await import('../src/channel-health.js')
-    await Promise.all(Array.from({ length: 10 }, (_, i) => recordChannelBlock(block(i))))
-    const stored = await readChannelHealth()
+    await Promise.all(Array.from({ length: 10 }, (_, i) => recordChannelBlock(ctx, block(i))))
+    const stored = await readChannelHealth(ctx)
     expect(stored.recentBlocks.map((entry) => entry.at).sort((a, b) => a - b))
       .toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
   })
 
-  it.skipIf(isWindows)('creates a missing home directory instead of dropping the first block', async () => {
-    // DSH_HOME 指向尚不存在的目录时，第一次记录曾经直接 ENOENT：真实拦截的第一条
-    // 证据就这样丢了，而那正是这个功能存在的理由。锁要在 <file>.lock 上 wx 创建，
-    // 它不会替我们建父目录，所以父目录必须由我们建成。
-    home = join(home, 'not-created-yet')
-    vi.stubEnv('DSH_HOME', home)
+  it('keeps serving later writes after one of them fails', async () => {
+    // 队列尾巴若在失败后变成 rejected，后续每一次写入都会立刻跟着失败——
+    // 一次偶发错误就把健康态永久打死。
+    let failNext = true
+    const flaky = flakyFacility(() => {
+      if (!failNext) return false
+      failNext = false
+      return true
+    })
     const { recordChannelBlock, readChannelHealth } = await import('../src/channel-health.js')
-    await expect(recordChannelBlock(block(3))).resolves.toBeUndefined()
-    expect((await readChannelHealth()).lastBlock).toMatchObject({ at: 3 })
-    // 目录是本代码建的：诊断文件没有理由让同机其它用户列目录。
-    expect(statSync(home).mode & 0o077).toBe(0)
-  })
-
-  it.skipIf(isWindows)('narrows the file mode to owner-only', async () => {
-    const { recordChannelBlock } = await import('../src/channel-health.js')
-    await recordChannelBlock(block(1))
-    const mode = statSync(healthFile()).mode & 0o777
-    expect(mode & 0o077).toBe(0)
-  })
-
-  it.skipIf(isWindows)('still reads a file whose mode was widened by hand', async () => {
-    // Review Focus 第 4 条：读宽松、写严格。文件被 chmod 坏了不该让卡片报错。
-    const { recordChannelBlock, readChannelHealth } = await import('../src/channel-health.js')
-    await recordChannelBlock(block(7))
-    chmodSync(healthFile(), 0o644)
-    expect((await readChannelHealth()).lastBlock).toMatchObject({ at: 7 })
-  })
-
-  it.skipIf(isWindows)('rewrites the widened mode back to owner-only on the next write', async () => {
-    const { recordChannelBlock } = await import('../src/channel-health.js')
-    await recordChannelBlock(block(1))
-    chmodSync(healthFile(), 0o644)
-    await recordChannelBlock(block(2))
-    expect(statSync(healthFile()).mode & 0o077).toBe(0)
+    await expect(recordChannelBlock(flaky.ctx, block(1))).rejects.toThrow('backend down')
+    await expect(recordChannelBlock(flaky.ctx, block(2))).resolves.toBeUndefined()
+    expect((await readChannelHealth(flaky.ctx)).recentBlocks.map((entry) => entry.at)).toEqual([2])
   })
 })
 
@@ -183,12 +158,76 @@ describe('saveProbeResult', () => {
   it('does not touch lastBlock', async () => {
     // 自检不能污染「上次真实拦截」。
     const { recordChannelBlock, saveProbeResult, readChannelHealth } = await import('../src/channel-health.js')
-    await recordChannelBlock(block(1))
-    await saveProbeResult({ verdict: 'healthy', at: 2, model: 'm1', stages: [] })
-    const stored = await readChannelHealth()
+    await recordChannelBlock(ctx, block(1))
+    await saveProbeResult(ctx, { verdict: 'healthy', at: 2, model: 'm1', stages: [] })
+    const stored = await readChannelHealth(ctx)
     expect(stored.lastProbe).toMatchObject({ verdict: 'healthy', at: 2 })
     expect(stored.lastBlock).toMatchObject({ at: 1 })
     expect(stored.recentBlocks).toHaveLength(1)
+  })
+
+  it('replaces an older verdict instead of appending one', async () => {
+    const { saveProbeResult, readChannelHealth } = await import('../src/channel-health.js')
+    await saveProbeResult(ctx, { verdict: 'healthy', at: 1, model: 'm1', stages: [] })
+    await saveProbeResult(ctx, { verdict: 'rule-gone', at: 2, model: 'm1', stages: [] })
+    expect((await readChannelHealth(ctx)).lastProbe).toMatchObject({ verdict: 'rule-gone', at: 2 })
+  })
+})
+
+describe('legacy file migration', () => {
+  it('imports the old health file once and deletes it', async () => {
+    // 1.2.x 及更早把健康态写在 `$DSH_HOME/codebuddy-channel-health.json`。
+    // 迁移只在**新存储为空**时发生，成功后旧文件消失。
+    writeFileSync(legacyFile(), JSON.stringify({
+      lastProbe: { verdict: 'healthy', at: 5, model: 'm1', stages: [] },
+      lastBlock: block(2),
+      recentBlocks: [block(1)],
+    }))
+    const { readChannelHealth } = await import('../src/channel-health.js')
+    const stored = await readChannelHealth(ctx)
+    expect(stored.recentBlocks.map((entry) => entry.at)).toEqual([1, 2])
+    expect(stored.lastProbe).toMatchObject({ verdict: 'healthy', at: 5 })
+    expect(existsSync(legacyFile())).toBe(false)
+  })
+
+  it('imports lastBlock even when recentBlocks is missing', async () => {
+    // 旧格式里 `lastBlock` 是独立字段，可能与数组不同步。
+    writeFileSync(legacyFile(), JSON.stringify({ lastBlock: block(7) }))
+    const { readChannelHealth } = await import('../src/channel-health.js')
+    expect((await readChannelHealth(ctx)).lastBlock).toMatchObject({ at: 7 })
+  })
+
+  it('drops records the current schema rejects instead of failing the import', async () => {
+    // 旧文件是明文可手改的：坏记录当它不存在，不能让整次迁移失败——
+    // 失败会留下一个「新存储空 + 旧文件在」的状态，每次启动都重试。
+    writeFileSync(legacyFile(), JSON.stringify({
+      recentBlocks: [block(1), { at: 'not-a-number' }, { at: 3, fingerprintGuess: 'garbage' }],
+      lastProbe: { verdict: 1 },
+    }))
+    const { readChannelHealth } = await import('../src/channel-health.js')
+    const stored = await readChannelHealth(ctx)
+    expect(stored.recentBlocks.map((entry) => entry.at)).toEqual([1])
+    expect(stored.lastProbe).toBeUndefined()
+  })
+
+  it('leaves a corrupt legacy file alone and keeps the store empty', async () => {
+    writeFileSync(legacyFile(), '{not json')
+    const { readChannelHealth } = await import('../src/channel-health.js')
+    expect(await readChannelHealth(ctx)).toEqual({ recentBlocks: [] })
+    // 读不出内容就没有东西可迁：文件留着，不假装迁移成功。
+    expect(existsSync(legacyFile())).toBe(true)
+  })
+
+  it('migrates once, not on every read', async () => {
+    // 迁移在 store 第一次打开时做一次并记住结果。若每次读都重跑，历史会在
+    // 「旧文件还在」的窗口里被反复追加，同一批拦截出现多份。
+    writeFileSync(legacyFile(), JSON.stringify({ recentBlocks: [block(1)] }))
+    const { recordChannelBlock, readChannelHealth } = await import('../src/channel-health.js')
+    await recordChannelBlock(ctx, block(2))
+    const first = await readChannelHealth(ctx)
+    const second = await readChannelHealth(ctx)
+    expect(first.recentBlocks.map((entry) => entry.at)).toEqual([1, 2])
+    expect(second.recentBlocks.map((entry) => entry.at)).toEqual([1, 2])
   })
 })
 
@@ -413,8 +452,8 @@ describe('probeChannel', () => {
   it('never feeds its own block into the block log', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => blockedResponse()))
     const { probeChannel, readChannelHealth } = await import('../src/channel-health.js')
-    await probeChannel({ session: fakeSession(), baseURL: 'https://copilot.tencent.com/v2' })
-    const stored = await readChannelHealth()
+    await probeChannel({ session: fakeSession(), baseURL: 'https://copilot.tencent.com/v2', health: ctx })
+    const stored = await readChannelHealth(ctx)
     expect(stored.lastBlock).toBeUndefined()
   })
 
@@ -486,11 +525,11 @@ describe('probeChannel', () => {
       ...fakeSession(),
       authHeaders: async () => { throw new NotLoggedInError('the session expired') },
     }
-    const result = await probeChannel({ session: expired as never, baseURL: 'https://copilot.tencent.com/v2' })
+    const result = await probeChannel({ session: expired as never, baseURL: 'https://copilot.tencent.com/v2', health: ctx })
     expect(result.verdict).toBe('auth')
     expect(result.stages).toEqual([])
     expect(calls).toHaveLength(0)
-    expect((await readChannelHealth()).lastProbe?.verdict).not.toBe('unreachable')
+    expect((await readChannelHealth(ctx)).lastProbe?.verdict).not.toBe('unreachable')
   })
 
   it('propagates a caller abort instead of persisting unreachable', async () => {
@@ -503,33 +542,32 @@ describe('probeChannel', () => {
       })))
     const { probeChannel, readChannelHealth } = await import('../src/channel-health.js')
     await expect(probeChannel(
-      { session: fakeSession(), baseURL: 'https://copilot.tencent.com/v2' },
+      { session: fakeSession(), baseURL: 'https://copilot.tencent.com/v2', health: ctx },
       controller.signal,
     )).rejects.toThrow()
-    expect((await readChannelHealth()).lastProbe).toBeUndefined()
+    expect((await readChannelHealth(ctx)).lastProbe).toBeUndefined()
   })
 
   it('still persists unreachable for a genuine transport failure', async () => {
     // 「网关真的连不上」与「我们自己取消」必须分开：前者仍按 §5 记 unreachable。
     vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed') }))
     const { probeChannel, readChannelHealth } = await import('../src/channel-health.js')
-    const result = await probeChannel({ session: fakeSession(), baseURL: 'https://copilot.tencent.com/v2' })
+    const result = await probeChannel({ session: fakeSession(), baseURL: 'https://copilot.tencent.com/v2', health: ctx })
     expect(result.verdict).toBe('unreachable')
-    expect((await readChannelHealth()).lastProbe?.verdict).toBe('unreachable')
+    expect((await readChannelHealth(ctx)).lastProbe?.verdict).toBe('unreachable')
   })
 
   it('returns the verdict and warns when the result cannot be persisted', async () => {
     // 三次请求已经花掉、结论已经算出来：写盘失败只该进 warn，不能让 probe() 拒绝
-    // 并把这次读数丢掉。用一个文件冒充 $DSH_HOME，mkdir 必然失败。
-    const blockedHome = join(home, 'not-a-directory')
-    writeFileSync(blockedHome, 'x')
-    vi.stubEnv('DSH_HOME', blockedHome)
+    // 并把这次读数丢掉。
+    const broken = flakyFacility(() => true)
     vi.stubGlobal('fetch', vi.fn(async () => okResponse()))
     const warn = vi.fn()
     const { probeChannel } = await import('../src/channel-health.js')
     const result = await probeChannel({
       session: fakeSession(),
       baseURL: 'https://copilot.tencent.com/v2',
+      health: broken.ctx,
       warn,
     })
     expect(result.verdict).toBe('rule-gone')
